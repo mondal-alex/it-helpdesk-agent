@@ -1,0 +1,20 @@
+[project]
+name = "it-helpdesk-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.6.0",
+    "ruff>=0.15.16",
+]
+
+[tool.ruff]
+# Set the maximum line length to 79.
+line-length = 88
+
+[tool.ruff.lint]
+# Add the `line-too-long` rule to the enforced rule set.
+extend-select = ["E501"]
