@@ -77,6 +77,27 @@ def test_jira_request_retries_on_429():
     assert mock_request.call_count == 2
 
 
+def test_bulk_mode_raises_default_concurrency(monkeypatch):
+    from rate_limit import (
+        _default_jira_concurrent,
+        _default_llm_concurrent,
+        bulk_mode_enabled,
+        reset_concurrency_gates,
+    )
+
+    monkeypatch.delenv("EVAL_BULK_MODE", raising=False)
+    reset_concurrency_gates()
+    assert bulk_mode_enabled() is False
+    assert _default_llm_concurrent() == 2
+    assert _default_jira_concurrent() == 3
+
+    monkeypatch.setenv("EVAL_BULK_MODE", "1")
+    reset_concurrency_gates()
+    assert bulk_mode_enabled() is True
+    assert _default_llm_concurrent() == 12
+    assert _default_jira_concurrent() == 8
+
+
 def test_jira_request_does_not_retry_client_errors():
     bad = MagicMock()
     bad.status_code = 400

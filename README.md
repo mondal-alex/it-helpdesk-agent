@@ -1,306 +1,175 @@
 # IT Help Desk Agent
 
-## 1. Project Overview
+Auto-triage for **Helix Industries** IT Service Desk tickets in Jira. The agent answers from ten IT policies (`policies/policies.yaml`, 60 clauses) and either **resolves** with a grounded citation or **defers** to a human with a standardized reason code.
 
-This agent resolves IT Help Desk tickets stored in a Jira Kanban board. To resolve a ticket, it references a fixed set of Helix IT policies. If it cannot answer from those policies with full confidence, it defers the ticket to a human with a standardized reason code.
+The LLM returns structured JSON (`ResolveDecision` | `DeferDecision`). `runner.py` applies grounding gates and writes to Jira — the model never calls Jira directly.
 
-The LLM triages each ticket by returning a **structured decision** (`ResolveDecision` or `DeferDecision`). It does **not** call Jira directly. Application code in `runner.py` applies the decision after grounding gates — keeping side effects deterministic and separate from the model loop.
+## Deliverables
 
-## 2. Architecture
+| Item | Location |
+|------|----------|
+| Working agent | This repo — webhook + Jira comment, label, transition |
+| README | This file — architecture, prompt, grounding, production notes |
+| Eval report | `eval/results.csv` — all 50 tickets, predicted vs ground truth |
+| Walkthrough | 5-min Loom or live demo (see **Live demo** below) |
 
-### 2.1 Overview
+**Loom / demo:** show one ticket end-to-end (webhook → Under Agent Review → resolved or deferred comment with citation or reason code), run offline eval or `summarize_live_eval.py`, and briefly cover production hardening.
 
-| Layer | Module | Role |
-|-------|--------|------|
-| Prompt | `prompt.py` | Full policy corpus in system prompt + triage rules |
-| Agent | `agent.py` | LangChain agent with structured JSON output |
-| Runner | `runner.py` | Orchestrates triage → grounding gates → Jira |
-| Grounding | `grounding.py` | Gate 1: verify cited clauses exist |
-| Models | `models.py` | Pydantic RESOLVE/DEFER contract, citations, comment formatting |
-| Policies | `policies/` | `policies.yaml` + retriever interface (full-corpus baseline) |
-| Jira | `tools.py` | `handle_ticket(id, decision)` — comment, label, transition |
-| Rate limits | `rate_limit.py` | Concurrency caps + retry/backoff for Gemini and Jira REST |
-| Webhook | `serve.py` | FastAPI listener — Jira `issue_created` → `process_ticket` |
-| Eval | `eval/` | 50-ticket harness + CSV metrics |
+## Quick start
 
-The agent uses a **full-corpus grounding strategy**: all 60 policy clauses (~2.8k tokens) are rendered into the system prompt. At this corpus size, retrieval recall beats top-k RAG; the `PolicyRetrieverInterface` seam allows a vector/hybrid retriever later without changing the runner.
-
-### 2.2 Sequence Diagram
-
-```mermaid
-sequenceDiagram
-    participant J as Jira Ticket
-    participant S as serve.py (FastAPI)
-    participant R as runner.py
-    participant RL as rate_limit.py
-    participant A as Agent (LangChain)
-    participant G as Grounding Gates
-    participant API as Jira API
-
-    J->>S: Webhook (issue_created)
-    S->>R: process_ticket(id, body) [background]
-    R->>RL: jira_request (concurrency cap)
-    RL->>API: transition → Under Agent Review
-    R->>RL: run_with_llm_retry (concurrency cap)
-    RL->>A: invoke (system prompt + ticket)
-    Note over A: Full policy corpus in context
-    A->>R: ResolveDecision | DeferDecision
-    R->>G: Gate 1: citation exists
-    G->>R: pass or force DEFER
-    R->>RL: jira_request
-    RL->>API: handle_ticket(id, decision)
-    API->>J: comment + label + transition (RESOLVED | NEEDS MANUAL REVIEW)
-    Note over RL: On 429/503: Retry-After or exponential backoff + jitter
-```
-
-### 2.3 Decision Flow
-
-```mermaid
-flowchart TD
-    S([START]) --> T[Jira ticket ingested]
-    T --> P[System prompt + full policy corpus]
-    P --> A[LLM structured output]
-    A --> D{RESOLVE or DEFER?}
-    D -->|RESOLVE| G1[Gate 1: citation exists]
-    D -->|DEFER| H[handle_ticket → Jira API]
-    G1 --> H
-    H --> E([END])
-```
-
-### 2.4 Webhook concurrency
-
-Each `issue_created` webhook returns **200 immediately** and runs `process_ticket` in a FastAPI background task. Many webhooks at once (e.g. bulk seeding) can queue dozens of background threads; `rate_limit.py` caps how many Gemini and Jira calls run in parallel regardless of thread-pool size (see §7).
-
-### 2.5 Python Dependencies (Direct)
-
-| Name | Tag | Reason |
-|------|-----|--------|
-| LangChain | `langchain` | Agent with structured output |
-| Pydantic | `pydantic` | RESOLVE/DEFER decision models |
-| python-dotenv | `python-dotenv` | Environment configuration |
-| FastAPI + Uvicorn | `fastapi`, `uvicorn` | Jira webhook service |
-| requests | (via LangChain deps) | Jira REST API calls |
-
-## 3. Configuration
-
-Copy `.env.example` to `.env` and fill in values.
-
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `MODEL` | Yes | LangChain model id (e.g. `google_genai:gemini-2.5-flash`, `ollama:qwen2.5:7b`) |
-| `GOOGLE_API_KEY` | For Gemini | API key from [Google AI Studio](https://aistudio.google.com/apikey) |
-| `JIRA_DOMAIN` | Yes | Atlassian site subdomain (e.g. `mondalalex`) |
-| `JIRA_EMAIL` | Yes | Jira account email |
-| `JIRA_API_TOKEN` | Yes | Atlassian API token |
-| `JIRA_PROJECT_KEY` | Seed script | Jira project key (e.g. `BTS`) |
-| `JIRA_ISSUE_TYPE` | Seed script | Issue type name (default `Task`) |
-| `IN_REVIEW_COLUMN_STATUS` | Yes | Jira status while agent triages (e.g. `Under Agent Review`) |
-| `DEFER_COLUMN_STATUS` | Yes | Jira status for deferred tickets (e.g. `NEEDS MANUAL REVIEW`) |
-| `RESOLVED_COLUMN_STATUS` | Yes | Jira status for resolved tickets (e.g. `RESOLVED`) |
-| `JIRA_WEBHOOK_SECRET` | No | HMAC secret from Jira webhook settings; verified via `X-Hub-Signature` |
-| `WEBHOOK_PORT` | No | Local port for `serve.py` (default `8000`) |
-| `WEBHOOK_PUBLIC_URL` | Dev | Public HTTPS base URL for webhooks (ngrok free static domain) |
-
-Status names in `.env` are matched **case-insensitively** against Jira transition targets (`tools._find_transition_id`).
-
-Optional rate-limit guards (see §7 and `rate_limit.py`; defaults shown):
-
-| Variable | Default | Purpose |
-|----------|---------|---------|
-| `LLM_MAX_CONCURRENT` | `2` | Cap parallel Gemini calls (RPM/TPM protection) |
-| `JIRA_MAX_CONCURRENT` | `3` | Cap parallel Jira REST calls (tenant burst limits) |
-| `API_RETRY_MAX_ATTEMPTS` | `5` | Retries on transient 429/503 |
-| `API_RETRY_INITIAL_DELAY` | `1.0` | Exponential backoff start (seconds) |
-| `API_RETRY_MAX_DELAY` | `60.0` | Backoff ceiling (seconds) |
-
-## 4. Running
-
-### Install
+Requires **Python 3.13+** and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
+cp .env.example .env          # MODEL, Jira creds, workflow status names
+./scripts/dev.sh              # uvicorn + ngrok (set WEBHOOK_PUBLIC_URL)
 ```
 
-### Local dev with ngrok (deterministic URL)
+Create a Jira Cloud project, match workflow statuses in `.env` to your board columns, and register webhook `$WEBHOOK_PUBLIC_URL/rest/webhooks/jira` for **Issue created**. Policies live in `policies/policies.yaml`; eval tickets in `tests/fixtures/eval_tickets.py`.
 
-Jira Cloud requires a public HTTPS URL. Use ngrok's **free static domain** so the URL stays the same every run.
+## Architecture
 
-**One-time setup:**
+| Layer | Module | Role |
+|-------|--------|------|
+| Prompt | `prompt.py` | Full policy corpus + triage rules |
+| Agent | `agent.py` | LangChain agent, structured JSON output |
+| Runner | `runner.py` | Triage → grounding gates → Jira |
+| Grounding | `grounding.py` | Gate 1: cited clauses exist |
+| Models | `models.py` | RESOLVE/DEFER contract, comment formatting |
+| Policies | `policies/` | `policies.yaml` + retriever interface |
+| Jira | `tools.py` | Atomic transition: comment + label + status |
+| Rate limits | `rate_limit.py` | Concurrency caps + retry/backoff |
+| Webhook | `serve.py` | `issue_created` → `process_ticket` |
+| Eval | `eval/` | 50-ticket harness + live CSV report |
 
-1. Sign up at [ngrok](https://ngrok.com/) and claim a free static domain at [dashboard.ngrok.com/domains](https://dashboard.ngrok.com/domains) (e.g. `your-name.ngrok-free.app`).
-2. Add your authtoken: `ngrok config add-authtoken <token>` ([get token](https://dashboard.ngrok.com/get-started/your-authtoken)).
-3. Install ngrok: `brew install ngrok/ngrok/ngrok`
-4. Set in `.env`:
-   ```
-   WEBHOOK_PORT=8000
-   WEBHOOK_PUBLIC_URL=https://your-name.ngrok-free.app
-   ```
-5. In Jira (**Settings → System → WebHooks**), set URL to:
-   ```
-   https://your-name.ngrok-free.app/rest/webhooks/jira
-   ```
+All 60 clauses (~2.8k tokens) are stuffed into the system prompt. At this corpus size, full-corpus beats top-k RAG on recall.
 
-**Every dev session:**
+```mermaid
+sequenceDiagram
+    participant J as Jira
+    participant S as serve.py
+    participant R as runner.py
+    participant A as Agent
+    participant G as Grounding
+
+    J->>S: Webhook issue_created
+    S->>R: process_ticket [background]
+    R->>J: Under Agent Review
+    R->>A: invoke
+    A->>R: ResolveDecision | DeferDecision
+    R->>G: Gate 1
+    R->>J: comment + label + transition
+    Note over R: On failure → manual review + support comment
+```
+
+**Principles:** LLM proposes, code disposes · fail closed on bad citations · pre-LLM security controls in production (see **Production hardening**).
+
+Webhooks return 200 immediately; triage runs in a background task. `rate_limit.py` caps parallel Gemini and Jira calls during bulk seeding.
+
+## Configuration
+
+Copy `.env.example` to `.env`. Status names are matched case-insensitively against Jira transition targets.
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `MODEL` | Yes | e.g. `google_genai:gemini-2.5-flash`, `ollama:qwen2.5:7b` |
+| `GOOGLE_API_KEY` | For Gemini | [AI Studio](https://aistudio.google.com/apikey) |
+| `JIRA_DOMAIN`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | Yes | Jira REST auth |
+| `IN_REVIEW_COLUMN_STATUS` | Yes | e.g. `Under Agent Review` |
+| `DEFER_COLUMN_STATUS` | Yes | e.g. `NEEDS MANUAL REVIEW` |
+| `RESOLVED_COLUMN_STATUS` | Yes | e.g. `RESOLVED` |
+| `JIRA_PROJECT_KEY` | Seed script | Project for eval ticket seeding |
+| `JIRA_WEBHOOK_SECRET` | No | HMAC via `X-Hub-Signature` |
+| `WEBHOOK_PUBLIC_URL` | Dev | ngrok static domain |
+| `LOG_LEVEL` | No | Default `INFO` |
+
+Rate limits: `LLM_MAX_CONCURRENT` (2, 12 with `EVAL_BULK_MODE=1`), `JIRA_MAX_CONCURRENT` (3, 8), `API_RETRY_MAX_*`. Live eval CSV: `EVAL_LIVE_REPORT_PATH` (`off` to disable).
+
+## Running
 
 ```bash
-chmod +x scripts/dev.sh   # once
-./scripts/dev.sh
+uv run uvicorn serve:app --host 0.0.0.0 --port 8000   # without ngrok
+uv run pytest                                          # unit tests (no LLM)
+uv run python -m eval.run_eval --output eval/results.csv
 ```
 
-This starts uvicorn locally and tunnels it to `WEBHOOK_PUBLIC_URL`. The script prints the exact Jira webhook URL on startup.
-
-### Webhook service (production path)
-
-```bash
-uv run uvicorn serve:app --host 0.0.0.0 --port 8000
-```
-
-Endpoints:
+**ngrok (one-time):** [free static domain](https://dashboard.ngrok.com/domains) → `ngrok config add-authtoken <token>` → set `WEBHOOK_PUBLIC_URL` → Jira webhook on Issue created.
 
 | Method | Path | Purpose |
 |--------|------|---------|
-| `GET` | `/health` | Liveness check |
-| `POST` | `/rest/webhooks/jira` | Jira `jira:issue_created` webhook |
+| `GET` | `/health` | Liveness |
+| `POST` | `/rest/webhooks/jira` | Jira webhook |
 
-Configure a Jira webhook (Settings → System → WebHooks) pointing at `$WEBHOOK_PUBLIC_URL/rest/webhooks/jira` (see **Local dev with ngrok** above) for **Issue created** events.
+**Logging:** `LOG_LEVEL` at `serve.py` startup and `eval/run_eval.py` main. Each triage logs `elapsed_ms` + token counts from `runner`. Ticket bodies are never logged.
 
-Optional: set `JIRA_WEBHOOK_SECRET` in Jira (**Settings → System → WebHooks → Secret**)
-and the same value in `.env`. Jira signs each delivery with `X-Hub-Signature: sha256=...`.
+**Seed eval tickets** (disable webhook first): `uv run python scripts/jira_eval_tickets.py seed` · delete: `delete --yes` · manifest: `eval/seeded_jira_issues.json`
 
-### Manual / script triage
+**Live demo (~4 min):** Terminal 1: `rm -f eval/live_results.csv && ./scripts/dev-teardown.sh && ./scripts/dev.sh` (`EVAL_BULK_MODE=1`, Gemini + key). Terminal 2: seed script. Wait for `ALL DONE — 50/50`, then `uv run python scripts/summarize_live_eval.py`.
 
-```python
-from runner import process_ticket
+## Prompt strategy
 
-result = process_ticket("HELIX-123", "How many vacation days do I have?")
-print(result.final_decision)
-```
+`prompt.py` builds a two-part system prompt:
 
-### Evaluation harness
+1. **Knowledge base** — all 10 policies / 60 clauses with stable ids (`POL-01 §1.4`). The model must cite verbatim; no outside knowledge.
+2. **Triage instructions** — mandatory DEFER checks before RESOLVE, all 12 reason codes, and judgment rules for edge cases (incidents, injection, PII, wrong tenant, etc.).
+
+The user message is the ticket body (summary + description from the webhook).
+
+- **RESOLVE** only when a specific clause directly answers with high confidence (≥1 citation). If the agent cites a clause as the basis, action must be RESOLVE.
+- **DEFER** when any mandatory rule fires, confidence is low, or the ticket is out of scope — even if related policy text exists.
+
+**DEFER reason codes:** `OUT_OF_SCOPE` (non-IT queue) · `ACTIVE_INCIDENT` (breach/malware) · `PRIVILEGED_ACCESS` (elevated access without workflow) · `WRONG_TENANT` (another company's policies) · `WRONG_INTENT` (troubleshooting, not policy Q&A) · `PII_REQUEST` (another employee's personal data) · `PROMPT_INJECTION` (instruction override) · `SPECULATIVE` (future/hypothetical policy) · `HOSTILE_TONE` (abuse/threats) · `NONEXISTENT_POLICY` (user cites missing policy) · `LOW_CONFIDENCE` (ambiguous context) · `CONFLICTING_POLICIES` (contradictory clauses — surface both, don't pick a side).
+
+## Grounding enforcement
+
+| Layer | Status | Mechanism |
+|-------|--------|-----------|
+| Prompt | Done | Corpus-only; mandatory DEFER when unsure |
+| Full corpus | Done | All clauses in context (~2.8k tokens) |
+| Pydantic schema | Done | Invalid RESOLVE/DEFER shapes rejected at parse |
+| Gate 1 | Done | `grounding.apply_grounding_gates` — every RESOLVE citation must resolve via `get_section()`; missing → fail closed to DEFER |
+| Gate 2 | Deferred | Entailment — answer supported by cited clause |
+| Retrieval threshold | Deferred | Low score → force `LOW_CONFIDENCE` DEFER |
+
+**Write ordering:** Jira side effects run only in `process_ticket` → `handle_ticket` (one atomic transition: comment + label + status), never inside the LLM loop. Gates run after the model returns, before any Jira call. Pipeline errors move the ticket to manual review with: *"Error during processing. Please refer to technical support."*
+
+## Evaluation
+
+**50 tickets** — 25 should RESOLVE (correct citation), 25 should DEFER (correct reason code). Fixtures: `tests/fixtures/eval_tickets.py`.
 
 ```bash
 uv run python -m eval.run_eval --output eval/results.csv
 ```
 
-Runs all 50 assignment tickets (no Jira writes — uses `triage_ticket` internally via the runner's agent path). Options: `--limit N`, `--ids T-001,T-026`.
+**Rubric** (`eval/metrics.py`): RESOLVE accuracy (action + citations), DEFER accuracy (action + reason code). False RESOLVE (resolving a should-defer ticket) is weighted **3×** a missed RESOLVE.
 
-### Bulk-load eval tickets into Jira
+Key CSV columns: `expected_action`, `final_action`, `final_citations`, `final_reason_code`, `gate_overridden`, `failure_analysis`, `false_resolve`, `missed_resolve`. Live webhook eval appends to `eval/live_results.csv` (deduped by `jira_issue_key`).
 
-Disable the Jira webhook first so new issues are not auto-triaged.
+## Production hardening
 
-Set `JIRA_PROJECT_KEY` in `.env` (and optionally `JIRA_ISSUE_TYPE`, default `Task`).
+Eval tickets cover many DEFER categories; production also needs controls beyond prompt rules:
 
-```bash
-# Preview
-uv run python scripts/jira_eval_tickets.py seed --dry-run
+- **Edge cases to design for:** out-of-scope / wrong-tenant routing · security incidents and privileged access (escalate, don't auto-close) · leaked credentials and prompt injection · hallucinated or future policies · multi-part and ambiguous tickets · non-English and attachments · hostile tone and third-party PII · duplicate and resurrected tickets · low retrieval confidence
+- **Routing:** intent classifier, tenant validation, sub-team queues
+- **Security:** pre-LLM secret/PII scan, SOC escalation, input sanitization
+- **Knowledge:** corpus CI/CD, policy-id allowlist, Gate 2 entailment
+- **Workflow:** webhook idempotency, `issue_updated` handling, dedicated bot account
+- **Observability:** today — module logs, LLM latency/tokens per triage, pipeline errors, live eval CSV. Production — trace id per ticket, structured JSON logs, metrics (RESOLVE/DEFER rate, gate overrides, 429s, latency p95), dashboards + alerts
+- **Ops:** Vault for secrets, shadow mode before auto-RESOLVE
 
-# Create all 50 tickets (labels: eval-seed, t-001, …)
-uv run python scripts/jira_eval_tickets.py seed
+## Policy & customer onboarding (FDE)
 
-# Smoke test with 3 tickets
-uv run python scripts/jira_eval_tickets.py seed --limit 3
-```
+Treat onboarding as **corpus + eval + wiring**:
 
-The script writes `eval/seeded_jira_issues.json` with eval id → issue key mappings.
+1. Normalize policies to `policies.yaml` with stable `POL-XX §Y.Z` ids
+2. Add golden eval tickets (RESOLVE + DEFER per clause cluster)
+3. Run eval — block on RESOLVE regression or false-RESOLVE spikes
+4. Tag corpus version; shadow live traffic before auto-RESOLVE
+5. New customers: isolated corpus + tenant config; parameterize org name in `build_system_prompt`
 
-Remove seeded tickets:
+When the corpus outgrows context budget, swap in a hybrid retriever behind `PolicyRetrieverInterface`; keep `get_section()` for Gate 1.
 
-```bash
-uv run python scripts/jira_eval_tickets.py delete --dry-run
-uv run python scripts/jira_eval_tickets.py delete --yes
-```
+## Links
 
-Delete uses the manifest by default; pass `--ignore-manifest` to find issues by the `eval-seed` label instead.
-
-## 5. Prompt Strategy
-
-The system prompt has two parts:
-
-1. **Knowledge base** — all 10 policies / 60 clauses rendered with exact citation ids (`POL-01 §1.4`). The model must copy citations verbatim; no prior knowledge allowed.
-2. **Triage instructions** — when to RESOLVE vs DEFER, all 12 defer reason codes, and critical judgment rules (active incidents, prompt injection, privileged access, etc.).
-
-The user message is the ticket body text (summary + description from the Jira webhook).
-
-The agent returns a discriminated union:
-- **RESOLVE** — `action`, `answer`, `citations` (required, min 1)
-- **DEFER** — `action`, `answer`, `reason_code`, optional `citations`
-
-## 6. Grounding
-
-Grounding is enforced in layers:
-
-| Layer | Status | Mechanism |
-|-------|--------|-----------|
-| Prompt | Done | "Only use Knowledge base"; defer when unsure |
-| Full corpus | Done | All clauses always in context |
-| Pydantic schema | Done | Invalid RESOLVE/DEFER combinations rejected at parse time |
-| Gate 1: citation exists | Done | `get_section()` lookup before Jira write; fail closed to DEFER |
-| Gate 2: faithfulness | Deferred | Optional LLM entailment check — add if eval shows false RESOLVEs |
-
-Jira writes happen only in `runner.process_ticket` → `handle_ticket`, never inside the LLM loop.
-
-## 7. Rate limit strategy
-
-Bulk webhooks or seed scripts can enqueue many tickets at once. Without guards, Starlette's default thread pool (40 workers) would fan out parallel Gemini and Jira calls and hit provider limits quickly. `rate_limit.py` applies a **two-part strategy**: cap concurrency, then retry transient failures.
-
-### 7.1 Gemini ([rate limits](https://ai.google.dev/gemini-api/docs/rate-limits))
-
-Google enforces **RPM**, **TPM**, and **RPD** per project; exceeding any dimension returns **429 `RESOURCE_EXHAUSTED`**. The [troubleshooting guide](https://ai.google.dev/gemini-api/docs/troubleshooting) recommends exponential backoff with jitter on transient errors — the official Gen AI SDK uses ~5 attempts, 1s initial delay, 60s max.
-
-**Our approach (`run_with_llm_retry` in `runner.py`):**
-
-- **`LLM_MAX_CONCURRENT` (default 2)** — limits in-flight `AGENT.invoke` calls. This is a conservative heuristic to reduce RPM/TPM bursts during webhook storms; it is not a published Google quota value. Tune against your tier in [AI Studio](https://aistudio.google.com/).
-- **Retry** — up to `API_RETRY_MAX_ATTEMPTS` on 429/503-style errors with exponential backoff + jitter.
-
-### 7.2 Jira ([Atlassian guidance](https://www.atlassian.com/blog/development/api-rate-limit-handling-for-apps))
-
-Jira Cloud throttles by **tenant concurrent load**. Responses may include **429** or **503** and optionally a **`Retry-After`** header (or `Beta-Retry-After`). Atlassian recommends honoring that header, otherwise exponential backoff + jitter.
-
-**Our approach (`jira_request` in `tools.py`, also used by the seed script):**
-
-- **`JIRA_MAX_CONCURRENT` (default 3)** — limits parallel REST calls across transitions, comments, labels, and search. Another conservative heuristic aligned with Atlassian's advice to keep concurrency low on longer requests.
-- **Retry** — 429, 408, 503; uses `Retry-After` when present, else exponential backoff + jitter (same env vars as Gemini retries).
-
-### 7.3 Defaults and tuning
-
-| Variable | Default | Role |
-|----------|---------|------|
-| `LLM_MAX_CONCURRENT` | `2` | Max parallel Gemini invocations |
-| `JIRA_MAX_CONCURRENT` | `3` | Max parallel Jira REST calls |
-| `API_RETRY_MAX_ATTEMPTS` | `5` | Retry budget per call |
-| `API_RETRY_INITIAL_DELAY` | `1.0` | Backoff start (seconds) |
-| `API_RETRY_MAX_DELAY` | `60.0` | Backoff ceiling (seconds) |
-
-If logs still show 429s after retries, lower concurrency. If throughput is safe and logs are clean, raise caps gradually. Daily Gemini quota exhaustion (RPD) will not recover until the reset window — retries cannot fix that.
-
-## 8. Evaluation
-
-The eval set (`tests/fixtures/eval_tickets.py`) contains all 50 assignment tickets with ground-truth RESOLVE citations and DEFER reason codes.
-
-Metrics (`eval/metrics.py`):
-
-- **RESOLVE accuracy** — correct action + expected citations present
-- **DEFER accuracy** — correct action + reason code match
-- **Weighted errors** — missed RESOLVE + 3× false RESOLVE (per assignment rubric)
-
-Run locally and inspect `eval/results.csv` for per-ticket agent vs final (post-gate) columns.
-
-## 9. Production hardening (deferred)
-
-Items intentionally out of scope for the take-home demo but worth doing before a real rollout:
-
-| Item | Effort | Notes |
-|------|--------|-------|
-| **Dedicated bot Jira account** | ~10 min setup, 0 code | Create an Atlassian user named “IT Help Desk Agent”, invite it to the site, use its API token for `JIRA_EMAIL`. Jira attributes REST comments to the authenticated user — there is no per-comment author override. |
-| **Assign deferred tickets to a human** | ~20–30 min | One `PUT /rest/api/3/issue/{key}` with `fields.assignee.accountId` in `handle_ticket`, gated by optional `JIRA_ASSIGNEE_ACCOUNT_ID` in `.env`. Typically assign on **DEFER** only (manual review queue); auto-**RESOLVE** tickets usually stay unassigned. |
-| **Gate 2: faithfulness check** | ~2–4 hrs | LLM entailment pass before RESOLVE writes (see §6). |
-| **Webhook idempotency + retries** | ~1–2 hrs | Dedupe by issue key + event id; retry failed background triage. |
-
-To find your Atlassian `accountId` for assignment: **Profile → … → Copy account ID**, or `GET /rest/api/3/myself` with your API token.
-
-## 10. Useful Links
-
-- [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing)
-- [Gemini API rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)
-- [Jira API rate limit handling](https://www.atlassian.com/blog/development/api-rate-limit-handling-for-apps)
-- Mermaid Charts in Markdown: https://www.markdownlang.com/advanced/diagrams.html
+- [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing) · [rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)
+- [Jira API rate limits](https://www.atlassian.com/blog/development/api-rate-limit-handling-for-apps)

@@ -10,13 +10,17 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
+
+load_dotenv()
+
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
+from eval.live_progress import live_progress
+from eval.report import lookup_eval_ticket, record_live_result
+from logging_config import configure_logging
 from models import DeferDecision, ResolveDecision
 from runner import process_ticket
-
-load_dotenv()
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +34,11 @@ app = FastAPI(
     description="Receives Jira webhooks and triages tickets via runner.process_ticket.",
     version="0.1.0",
 )
+
+
+@app.on_event("startup")
+def _configure_logging() -> None:
+    configure_logging()
 
 
 class WebhookAccepted(BaseModel):
@@ -157,6 +166,8 @@ def _verify_webhook_signature(request: Request, body: bytes) -> None:
 
 
 def _run_pipeline(issue_key: str, body: str) -> None:
+    progress = live_progress()
+    progress.started(issue_key, body)
     try:
         result = process_ticket(issue_key, body)
         summary = _decision_summary(issue_key, result)
@@ -166,8 +177,18 @@ def _run_pipeline(issue_key: str, body: str) -> None:
             summary.action,
             summary.gate_overridden,
         )
+        _record_live_eval(issue_key, body, result)
+        progress.finished(issue_key, body, action=summary.action, success=True)
     except Exception:
+        progress.finished(issue_key, body, action="ERROR", success=False)
         logger.exception("Failed to process Jira issue %s", issue_key)
+
+
+def _record_live_eval(issue_key: str, body: str, result) -> None:
+    try:
+        record_live_result(issue_key, body, result)
+    except Exception:
+        logger.exception("Failed to write live eval report for %s", issue_key)
 
 
 @app.get("/health", response_model=HealthResponse)
@@ -198,6 +219,8 @@ async def jira_webhook(
         return WebhookAccepted(message=f"Ignored event: {event}")
 
     issue_key, body = parsed
+    if lookup_eval_ticket(body):
+        live_progress().queued(issue_key, body)
     background_tasks.add_task(_run_pipeline, issue_key, body)
     return WebhookAccepted(
         issue_key=issue_key,

@@ -7,36 +7,11 @@ import csv
 import sys
 from pathlib import Path
 
-from eval.metrics import (
-    citation_strings,
-    format_summary,
-    score_ticket,
-    summarize,
-)
-from models import DeferDecision, ResolveDecision
+from eval.metrics import format_summary, score_ticket, summarize
+from eval.report import CSV_FIELDS, build_row
+from logging_config import configure_logging
 from runner import triage_ticket
 from tests.fixtures.eval_tickets import EVAL_TICKETS, EvalTicket
-
-CSV_FIELDS = [
-    "ticket_id",
-    "expected_action",
-    "expected_citations",
-    "expected_reason_code",
-    "agent_action",
-    "agent_citations",
-    "agent_reason_code",
-    "final_action",
-    "final_citations",
-    "final_reason_code",
-    "gate_overridden",
-    "action_correct",
-    "citation_correct",
-    "reason_correct",
-    "false_resolve",
-    "missed_resolve",
-    "agent_answer",
-    "final_answer",
-]
 
 
 def _select_tickets(
@@ -51,58 +26,6 @@ def _select_tickets(
     if limit is not None:
         selected = selected[:limit]
     return selected
-
-
-def _decision_fields(decision) -> tuple[str, str, str]:
-    if isinstance(decision, ResolveDecision):
-        return (
-            "RESOLVE",
-            "; ".join(citation_strings(decision)),
-            "",
-        )
-    assert isinstance(decision, DeferDecision)
-    return (
-        "DEFER",
-        "; ".join(citation_strings(decision)),
-        decision.reason_code.value,
-    )
-
-
-def _row(ticket: EvalTicket, result) -> dict[str, str]:
-    agent_action, agent_citations, agent_reason = _decision_fields(result.agent_decision)
-    final_action, final_citations, final_reason = _decision_fields(result.final_decision)
-    score = score_ticket(
-        ticket,
-        result.final_decision,
-        gate_overridden=result.gate_overridden,
-    )
-
-    return {
-        "ticket_id": ticket.id,
-        "expected_action": ticket.expected_action.value,
-        "expected_citations": "; ".join(ticket.expected_citations),
-        "expected_reason_code": (
-            ticket.expected_reason_code.value if ticket.expected_reason_code else ""
-        ),
-        "agent_action": agent_action,
-        "agent_citations": agent_citations,
-        "agent_reason_code": agent_reason,
-        "final_action": final_action,
-        "final_citations": final_citations,
-        "final_reason_code": final_reason,
-        "gate_overridden": str(result.gate_overridden),
-        "action_correct": str(score.action_correct),
-        "citation_correct": (
-            "" if score.citation_correct is None else str(score.citation_correct)
-        ),
-        "reason_correct": (
-            "" if score.reason_correct is None else str(score.reason_correct)
-        ),
-        "false_resolve": str(score.false_resolve),
-        "missed_resolve": str(score.missed_resolve),
-        "agent_answer": result.agent_decision.answer.replace("\n", " "),
-        "final_answer": result.final_decision.answer.replace("\n", " "),
-    }
 
 
 def run_eval(
@@ -129,7 +52,7 @@ def run_eval(
     for index, ticket in enumerate(tickets, start=1):
         print(f"[{index}/{len(tickets)}] {ticket.id}", flush=True)
         result = triage_ticket(ticket.id, ticket.body)
-        row = _row(ticket, result)
+        row = build_row(ticket, result)
         rows.append(row)
         agent_scores.append(
             score_ticket(
@@ -183,6 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated ticket ids (e.g. T-001,T-026)",
     )
     args = parser.parse_args(argv)
+    configure_logging()
 
     ids = frozenset(i.strip() for i in args.ids.split(",")) if args.ids else None
     tickets = _select_tickets(EVAL_TICKETS, ids=ids, limit=args.limit)

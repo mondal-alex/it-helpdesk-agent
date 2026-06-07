@@ -46,22 +46,34 @@ def _assert_decision_matches_sample(decision, sample: SampleTicket) -> None:
 
 
 @pytest.mark.parametrize("sample", RESOLVE_SAMPLES, ids=lambda s: s.id)
+@patch("runner.mark_under_agent_review")
 @patch("runner.handle_ticket")
-def test_process_ticket_resolve_samples(mock_handle_ticket, sample: SampleTicket):
+def test_process_ticket_resolve_samples(
+    mock_handle_ticket,
+    mock_in_review,
+    sample: SampleTicket,
+):
     from runner import process_ticket
 
     result = process_ticket(sample.id, sample.body)
 
     _assert_decision_matches_sample(result.final_decision, sample)
+    mock_in_review.assert_called_once_with(sample.id)
     mock_handle_ticket.assert_called_once_with(sample.id, result.final_decision)
 
 
 @pytest.mark.parametrize("sample", DEFER_SAMPLES, ids=lambda s: s.id)
+@patch("runner.mark_under_agent_review")
 @patch("runner.handle_ticket")
-def test_process_ticket_defer_samples(mock_handle_ticket, sample: SampleTicket):
+def test_process_ticket_defer_samples(
+    mock_handle_ticket,
+    mock_in_review,
+    sample: SampleTicket,
+):
     from runner import process_ticket
 
     result = process_ticket(sample.id, sample.body)
 
     _assert_decision_matches_sample(result.final_decision, sample)
+    mock_in_review.assert_called_once_with(sample.id)
     mock_handle_ticket.assert_called_once_with(sample.id, result.final_decision)

@@ -15,6 +15,9 @@ load_dotenv()
 
 _DEFER_LABEL = "defer"
 _RESOLVED_LABEL = "resolved"
+TRIAGE_ERROR_COMMENT = (
+    "Error during processing. Please refer to technical support."
+)
 
 _JIRA_ENV_VARS = (
     "JIRA_DOMAIN",
@@ -57,17 +60,29 @@ def mark_under_agent_review(jira_issue_id: str) -> None:
     )
 
 
+def mark_triage_failed(jira_issue_id: str) -> None:
+    """Move a failed ticket to manual review with a support-facing comment."""
+    transition_issue_to_status(
+        jira_issue_id,
+        _require_env("DEFER_COLUMN_STATUS"),
+        comment=TRIAGE_ERROR_COMMENT,
+        label=_DEFER_LABEL,
+    )
+
+
 def handle_ticket(
     jira_issue_id: str,
     decision: TicketDecision,
 ) -> None:
-    """Apply a triage decision to Jira: post comment, add label, transition status."""
+    """Apply a triage decision to Jira in one atomic transition request."""
     comment = format_ticket_comment(decision)
     status, label = _match(decision.action)
-
-    _post_comment(jira_issue_id, comment)
-    _add_label_to_issue(jira_issue_id, label)
-    transition_issue_to_status(jira_issue_id, status)
+    transition_issue_to_status(
+        jira_issue_id,
+        status,
+        comment=comment,
+        label=label,
+    )
 
 
 def _normalize_status_name(name: str) -> str:
@@ -93,8 +108,14 @@ def _find_transition_id(transitions: List[dict], status_name: str) -> str | None
     return case_insensitive_match
 
 
-def transition_issue_to_status(issue_id: str, status_name: str) -> None:
-    """Move an issue to a workflow status by Jira status name."""
+def transition_issue_to_status(
+    issue_id: str,
+    status_name: str,
+    *,
+    comment: str | None = None,
+    label: str | None = None,
+) -> None:
+    """Move an issue to a workflow status, optionally with comment and label."""
     transitions = _get_available_transitions(issue_id)
     transition_id = _find_transition_id(transitions, status_name)
 
@@ -107,7 +128,12 @@ def transition_issue_to_status(issue_id: str, status_name: str) -> None:
             "workflow state allows transitioning to it."
         )
 
-    _transition_to_destination(issue_id, destination_id=transition_id)
+    _transition_with_updates(
+        issue_id,
+        destination_id=transition_id,
+        comment=comment,
+        label=label,
+    )
 
 
 def _match(ticket_action: TicketAction) -> Tuple[str, str]:
@@ -132,27 +158,22 @@ def _comment_adf_body(text: str) -> dict:
     return {"type": "doc", "version": 1, "content": paragraphs}
 
 
-def _post_comment(issue_id: str, comment: str) -> None:
-    """Posts a comment to a Jira issue."""
-    url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}/comment"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    payload = json.dumps({"body": _comment_adf_body(comment)})
-
-    response = jira_request(
-        "POST",
-        url,
-        data=payload,
-        headers=headers,
-        auth=_jira_auth(),
-        timeout=10,
-    )
-    if response.status_code != 201:
-        raise requests.HTTPError(
-            f"Error posting comment: status {response.status_code}: {response.text}"
-        )
+def _build_transition_payload(
+    destination_id: str,
+    *,
+    comment: str | None = None,
+    label: str | None = None,
+) -> dict:
+    """Build a Jira transition request body with optional comment and label."""
+    body: dict = {"transition": {"id": destination_id}}
+    update: dict = {}
+    if comment is not None:
+        update["comment"] = [{"add": {"body": _comment_adf_body(comment)}}]
+    if label is not None:
+        update["labels"] = [{"add": label}]
+    if update:
+        body["update"] = update
+    return body
 
 
 def _get_available_transitions(issue_id: str) -> List[dict]:
@@ -171,14 +192,26 @@ def _get_available_transitions(issue_id: str) -> List[dict]:
     return response.json()["transitions"]
 
 
-def _transition_to_destination(issue_id: str, destination_id: str) -> None:
-    """Transition a Jira issue to the given workflow destination."""
+def _transition_with_updates(
+    issue_id: str,
+    *,
+    destination_id: str,
+    comment: str | None = None,
+    label: str | None = None,
+) -> None:
+    """Transition a Jira issue, bundling comment and label in the same request."""
     url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}/transitions"
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    payload = json.dumps({"transition": {"id": destination_id}})
+    payload = json.dumps(
+        _build_transition_payload(
+            destination_id,
+            comment=comment,
+            label=label,
+        )
+    )
 
     response = jira_request(
         "POST",
@@ -191,27 +224,4 @@ def _transition_to_destination(issue_id: str, destination_id: str) -> None:
     if response.status_code != 204:
         raise requests.HTTPError(
             f"Error transitioning issue: status {response.status_code}: {response.text}"
-        )
-
-
-def _add_label_to_issue(issue_id: str, label: str) -> None:
-    """Add a label to a Jira issue."""
-    url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}"
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-    }
-    payload = json.dumps({"update": {"labels": [{"add": label}]}})
-
-    response = jira_request(
-        "PUT",
-        url,
-        data=payload,
-        headers=headers,
-        auth=_jira_auth(),
-        timeout=10,
-    )
-    if response.status_code not in {200, 204}:
-        raise requests.HTTPError(
-            f"Error adding label: status {response.status_code}: {response.text}"
         )

@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -27,7 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from tests.fixtures.eval_tickets import EVAL_TICKETS, EvalTicket
-from rate_limit import jira_request
+from rate_limit import bulk_mode_enabled, jira_request
 from tools import _comment_adf_body, _jira_auth, _jira_base_url
 
 load_dotenv(ROOT / ".env")
@@ -199,24 +200,63 @@ def collect_delete_keys(
     return search_issue_keys(project_key, label)
 
 
+def _seed_parallelism(explicit: int | None) -> int:
+    if explicit is not None:
+        return max(1, explicit)
+    return 10 if bulk_mode_enabled() else 1
+
+
+def _seed_one(
+    project_key: str,
+    issue_type: str,
+    ticket: EvalTicket,
+) -> SeededIssue:
+    issue_key = create_issue(project_key, issue_type, ticket)
+    return SeededIssue(eval_id=ticket.id, issue_key=issue_key)
+
+
 def cmd_seed(args: argparse.Namespace) -> int:
     project_key = _project_key(args.project)
     issue_type = _issue_type(args.issue_type)
     tickets = EVAL_TICKETS[: args.limit] if args.limit else EVAL_TICKETS
+    parallel = _seed_parallelism(args.parallel)
 
     if args.dry_run:
         print(f"Would create {len(tickets)} issues in project {project_key}")
+        print(f"Parallel Jira creates: {parallel}")
         for ticket in tickets:
             print(f"  {ticket.id}: {summary_for(ticket)}")
         print(f"Manifest would be written to {MANIFEST_PATH}")
         return 0
 
     created: list[SeededIssue] = []
-    print(f"Creating {len(tickets)} eval tickets in {project_key} ...")
-    for index, ticket in enumerate(tickets, start=1):
-        issue_key = create_issue(project_key, issue_type, ticket)
-        created.append(SeededIssue(eval_id=ticket.id, issue_key=issue_key))
-        print(f"  [{index}/{len(tickets)}] {ticket.id} -> {issue_key}")
+    print(
+        f"Creating {len(tickets)} eval tickets in {project_key} "
+        f"(parallel={parallel}) ..."
+    )
+
+    if parallel <= 1:
+        for index, ticket in enumerate(tickets, start=1):
+            seeded = _seed_one(project_key, issue_type, ticket)
+            created.append(seeded)
+            print(f"  [{index}/{len(tickets)}] {ticket.id} -> {seeded.issue_key}")
+    else:
+        with ThreadPoolExecutor(max_workers=parallel) as pool:
+            futures = {
+                pool.submit(_seed_one, project_key, issue_type, ticket): ticket
+                for ticket in tickets
+            }
+            done = 0
+            for future in as_completed(futures):
+                ticket = futures[future]
+                seeded = future.result()
+                created.append(seeded)
+                done += 1
+                print(
+                    f"  [{done}/{len(tickets)}] {ticket.id} -> {seeded.issue_key}"
+                )
+
+    created.sort(key=lambda issue: issue.eval_id)
 
     write_manifest(
         SeedManifest(
@@ -284,6 +324,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--limit",
         type=int,
         help="Create only the first N eval tickets (for smoke tests)",
+    )
+    seed.add_argument(
+        "--parallel",
+        type=int,
+        default=None,
+        help="Parallel Jira creates (default: 10 with EVAL_BULK_MODE, else 1)",
     )
     seed.add_argument(
         "--dry-run",

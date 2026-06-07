@@ -1,6 +1,18 @@
 """Unit tests for Jira tooling (no API calls)."""
 
-from tools import _comment_adf_body, _find_transition_id, _normalize_status_name
+import json
+from unittest.mock import MagicMock, patch
+
+from models import ResolveDecision
+from tools import (
+    TRIAGE_ERROR_COMMENT,
+    _build_transition_payload,
+    _comment_adf_body,
+    _find_transition_id,
+    _normalize_status_name,
+    handle_ticket,
+    mark_triage_failed,
+)
 
 
 def test_comment_adf_body_multiline():
@@ -61,3 +73,80 @@ def test_find_transition_id_returns_none_when_missing():
     transitions = [{"id": "1", "to": {"name": "RESOLVED"}}]
 
     assert _find_transition_id(transitions, "UNDER AGENT REVIEW") is None
+
+
+def test_build_transition_payload_includes_comment_and_label():
+    payload = _build_transition_payload(
+        "5",
+        comment="Agent answer",
+        label="resolved",
+    )
+
+    assert payload == {
+        "transition": {"id": "5"},
+        "update": {
+            "comment": [
+                {
+                    "add": {
+                        "body": _comment_adf_body("Agent answer"),
+                    }
+                }
+            ],
+            "labels": [{"add": "resolved"}],
+        },
+    }
+
+
+def test_build_transition_payload_transition_only():
+    assert _build_transition_payload("3") == {"transition": {"id": "3"}}
+
+
+@patch("tools.jira_request")
+@patch("tools._get_available_transitions")
+@patch("tools._require_env")
+def test_handle_ticket_uses_single_transition_request(
+    mock_require_env,
+    mock_get_transitions,
+    mock_jira_request,
+):
+    mock_require_env.side_effect = lambda name: {
+        "RESOLVED_COLUMN_STATUS": "RESOLVED",
+        "JIRA_DOMAIN": "example",
+        "JIRA_EMAIL": "u@example.com",
+        "JIRA_API_TOKEN": "token",
+    }[name]
+    mock_get_transitions.return_value = [{"id": "9", "to": {"name": "RESOLVED"}}]
+    mock_jira_request.return_value = MagicMock(status_code=204)
+
+    decision = ResolveDecision(answer="ok", citations=["POL-01 §1.4"])
+    handle_ticket("HELIX-1", decision)
+
+    assert mock_jira_request.call_count == 1
+    call = mock_jira_request.call_args
+    assert call.args[0] == "POST"
+    assert call.args[1].endswith("/rest/api/3/issue/HELIX-1/transitions")
+
+    body = json.loads(call.kwargs["data"])
+    assert body["transition"] == {"id": "9"}
+    assert body["update"]["labels"] == [{"add": "resolved"}]
+    comment_text = body["update"]["comment"][0]["add"]["body"]["content"][0]["content"][0][
+        "text"
+    ]
+    assert comment_text == "Action: RESOLVED"
+
+
+@patch("tools.transition_issue_to_status")
+@patch("tools._require_env")
+def test_mark_triage_failed_moves_to_manual_review_with_support_comment(
+    mock_require_env,
+    mock_transition,
+):
+    mock_require_env.return_value = "NEEDS MANUAL REVIEW"
+    mark_triage_failed("HELIX-99")
+
+    mock_transition.assert_called_once_with(
+        "HELIX-99",
+        "NEEDS MANUAL REVIEW",
+        comment=TRIAGE_ERROR_COMMENT,
+        label="defer",
+    )
