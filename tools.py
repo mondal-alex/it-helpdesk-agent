@@ -19,6 +19,7 @@ _JIRA_ENV_VARS = (
     "JIRA_DOMAIN",
     "JIRA_EMAIL",
     "JIRA_API_TOKEN",
+    "IN_REVIEW_COLUMN_STATUS",
     "DEFER_COLUMN_STATUS",
     "RESOLVED_COLUMN_STATUS",
 )
@@ -47,6 +48,14 @@ def _jira_auth() -> HTTPBasicAuth:
     return HTTPBasicAuth(_require_env("JIRA_EMAIL"), _require_env("JIRA_API_TOKEN"))
 
 
+def mark_under_agent_review(jira_issue_id: str) -> None:
+    """Transition an issue to the in-review status while the agent triages it."""
+    transition_issue_to_status(
+        jira_issue_id,
+        _require_env("IN_REVIEW_COLUMN_STATUS"),
+    )
+
+
 def handle_ticket(
     jira_issue_id: str,
     decision: TicketDecision,
@@ -57,23 +66,27 @@ def handle_ticket(
 
     _post_comment(jira_issue_id, comment)
     _add_label_to_issue(jira_issue_id, label)
+    transition_issue_to_status(jira_issue_id, status)
 
-    transitions = _get_available_transitions(jira_issue_id)
+
+def transition_issue_to_status(issue_id: str, status_name: str) -> None:
+    """Move an issue to a workflow status by exact Jira status name."""
+    transitions = _get_available_transitions(issue_id)
     transition_id = next(
-        (t["id"] for t in transitions if t["to"]["name"] == status),
+        (t["id"] for t in transitions if t["to"]["name"] == status_name),
         None,
     )
 
     if not transition_id:
         available = [t["to"]["name"] for t in transitions]
         raise ValueError(
-            f"Could not find an available Jira transition for issue {jira_issue_id} "
-            f"to status '{status}'. Available destinations: {available}. "
+            f"Could not find an available Jira transition for issue {issue_id} "
+            f"to status '{status_name}'. Available destinations: {available}. "
             "Confirm the status exists on the board and that the issue's current "
             "workflow state allows transitioning to it."
         )
 
-    _transition_to_destination(jira_issue_id, destination_id=transition_id)
+    _transition_to_destination(issue_id, destination_id=transition_id)
 
 
 def _match(ticket_action: TicketAction) -> Tuple[str, str]:
@@ -85,6 +98,19 @@ def _match(ticket_action: TicketAction) -> Tuple[str, str]:
             return (_require_env("RESOLVED_COLUMN_STATUS"), _RESOLVED_LABEL)
 
 
+def _comment_adf_body(text: str) -> dict:
+    """Build Atlassian Document Format for a Jira v3 comment body."""
+    paragraphs = []
+    for line in text.split("\n"):
+        node: dict = {"type": "paragraph"}
+        if line:
+            node["content"] = [{"type": "text", "text": line}]
+        else:
+            node["content"] = []
+        paragraphs.append(node)
+    return {"type": "doc", "version": 1, "content": paragraphs}
+
+
 def _post_comment(issue_id: str, comment: str) -> None:
     """Posts a comment to a Jira issue."""
     url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}/comment"
@@ -92,25 +118,7 @@ def _post_comment(issue_id: str, comment: str) -> None:
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    payload = json.dumps(
-        {
-            "body": {
-                "content": [
-                    {
-                        "content": [{"text": comment, "type": "text"}],
-                        "type": "paragraph",
-                    }
-                ],
-                "type": "doc",
-                "version": 1,
-            },
-            "visibility": {
-                "identifier": "Administrators",
-                "type": "role",
-                "value": "Administrators",
-            },
-        }
-    )
+    payload = json.dumps({"body": _comment_adf_body(comment)})
 
     response = requests.post(
         url,

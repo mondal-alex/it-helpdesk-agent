@@ -4,7 +4,7 @@
 
 This agent resolves IT Help Desk tickets stored in a Jira Kanban board. To resolve a ticket, it references a fixed set of Helix IT policies. If it cannot answer from those policies with full confidence, it defers the ticket to a human with a standardized reason code.
 
-The LLM triages each ticket by returning a **structured decision** (`ResolveDecision` or `DeferDecision`). It does **not** call Jira directly. Application code in `runner.py` applies the decision after validation — keeping side effects deterministic and leaving room for grounding gates before anything is posted.
+The LLM triages each ticket by returning a **structured decision** (`ResolveDecision` or `DeferDecision`). It does **not** call Jira directly. Application code in `runner.py` applies the decision after grounding gates — keeping side effects deterministic and separate from the model loop.
 
 ## 2. Architecture
 
@@ -13,36 +13,38 @@ The LLM triages each ticket by returning a **structured decision** (`ResolveDeci
 | Layer | Module | Role |
 |-------|--------|------|
 | Prompt | `prompt.py` | Full policy corpus in system prompt + triage rules |
-| Agent | `agent.py` | LangChain agent with `response_format=DecisionUnion` (no tools) |
-| Runner | `runner.py` | Orchestrates triage → validation → Jira |
+| Agent | `agent.py` | LangChain agent with structured JSON output |
+| Runner | `runner.py` | Orchestrates triage → grounding gates → Jira |
+| Grounding | `grounding.py` | Gate 1: verify cited clauses exist |
 | Models | `models.py` | Pydantic RESOLVE/DEFER contract, citations, comment formatting |
 | Policies | `policies/` | `policies.yaml` + retriever interface (full-corpus baseline) |
 | Jira | `tools.py` | `handle_ticket(id, decision)` — comment, label, transition |
+| Webhook | `serve.py` | FastAPI listener — Jira `issue_created` → `process_ticket` |
+| Eval | `eval/` | 50-ticket harness + CSV metrics |
 
 The agent uses a **full-corpus grounding strategy**: all 60 policy clauses (~2.8k tokens) are rendered into the system prompt. At this corpus size, retrieval recall beats top-k RAG; the `PolicyRetrieverInterface` seam allows a vector/hybrid retriever later without changing the runner.
-
-A FastAPI webhook listener (`serve.py`, planned) will receive new Jira tickets and call `runner.process_ticket`.
 
 ### 2.2 Sequence Diagram
 
 ```mermaid
 sequenceDiagram
     participant J as Jira Ticket
-    participant S as Server (FastAPI)
+    participant S as serve.py (FastAPI)
     participant R as runner.py
     participant A as Agent (LangChain)
     participant G as Grounding Gates
     participant API as Jira API
 
-    J->>S: Webhook (new ticket)
-    S->>R: process_ticket(id, body)
+    J->>S: Webhook (issue_created)
+    S->>R: process_ticket(id, body) [background]
+    R->>API: transition → UNDER AGENT REVIEW
     R->>A: invoke (system prompt + ticket)
     Note over A: Full policy corpus in context
     A->>R: ResolveDecision | DeferDecision
-    R->>G: validate citations / faithfulness
+    R->>G: Gate 1: citation exists
     G->>R: pass or force DEFER
     R->>API: handle_ticket(id, decision)
-    API->>J: comment + label + transition
+    API->>J: comment + label + transition (RESOLVED | NEEDS MANUAL REVIEW)
 ```
 
 ### 2.3 Decision Flow
@@ -54,10 +56,9 @@ flowchart TD
     P --> A[LLM structured output]
     A --> D{RESOLVE or DEFER?}
     D -->|RESOLVE| G1[Gate 1: citation exists]
-    D -->|DEFER| G1
-    G1 --> G2[Gate 2: faithfulness check]
-    G2 --> J[handle_ticket → Jira API]
-    J --> E([END])
+    D -->|DEFER| H[handle_ticket → Jira API]
+    G1 --> H
+    H --> E([END])
 ```
 
 ### 2.4 Python Dependencies (Direct)
@@ -67,22 +68,112 @@ flowchart TD
 | LangChain | `langchain` | Agent with structured output |
 | Pydantic | `pydantic` | RESOLVE/DEFER decision models |
 | python-dotenv | `python-dotenv` | Environment configuration |
+| FastAPI + Uvicorn | `fastapi`, `uvicorn` | Jira webhook service |
 | requests | (via LangChain deps) | Jira REST API calls |
 
-## 3. Prompt Strategy
+## 3. Configuration
+
+Copy `.env.example` to `.env` and fill in values.
+
+| Variable | Required | Purpose |
+|----------|----------|---------|
+| `MODEL` | Yes | LangChain model id (e.g. `google_genai:gemini-2.5-flash`, `ollama:qwen2.5:7b`) |
+| `GOOGLE_API_KEY` | For Gemini | API key from [Google AI Studio](https://aistudio.google.com/apikey) |
+| `JIRA_DOMAIN` | Yes | Atlassian site subdomain (e.g. `mondalalex`) |
+| `JIRA_EMAIL` | Yes | Jira account email |
+| `JIRA_API_TOKEN` | Yes | Atlassian API token |
+| `IN_REVIEW_COLUMN_STATUS` | Yes | Jira status while agent triages (e.g. `UNDER AGENT REVIEW`) |
+| `DEFER_COLUMN_STATUS` | Yes | Jira status for deferred tickets (e.g. `NEEDS MANUAL REVIEW`) |
+| `RESOLVED_COLUMN_STATUS` | Yes | Jira status for resolved tickets (e.g. `RESOLVED`) |
+| `JIRA_WEBHOOK_SECRET` | No | HMAC secret from Jira webhook settings; verified via `X-Hub-Signature` |
+| `WEBHOOK_PORT` | No | Local port for `serve.py` (default `8000`) |
+| `WEBHOOK_PUBLIC_URL` | Dev | Public HTTPS base URL for webhooks (ngrok free static domain) |
+
+## 4. Running
+
+### Install
+
+```bash
+uv sync
+```
+
+### Local dev with ngrok (deterministic URL)
+
+Jira Cloud requires a public HTTPS URL. Use ngrok's **free static domain** so the URL stays the same every run.
+
+**One-time setup:**
+
+1. Sign up at [ngrok](https://ngrok.com/) and claim a free static domain at [dashboard.ngrok.com/domains](https://dashboard.ngrok.com/domains) (e.g. `your-name.ngrok-free.app`).
+2. Add your authtoken: `ngrok config add-authtoken <token>` ([get token](https://dashboard.ngrok.com/get-started/your-authtoken)).
+3. Install ngrok: `brew install ngrok/ngrok/ngrok`
+4. Set in `.env`:
+   ```
+   WEBHOOK_PORT=8000
+   WEBHOOK_PUBLIC_URL=https://your-name.ngrok-free.app
+   ```
+5. In Jira (**Settings → System → WebHooks**), set URL to:
+   ```
+   https://your-name.ngrok-free.app/webhook/jira
+   ```
+
+**Every dev session:**
+
+```bash
+chmod +x scripts/dev.sh   # once
+./scripts/dev.sh
+```
+
+This starts uvicorn locally and tunnels it to `WEBHOOK_PUBLIC_URL`. The script prints the exact Jira webhook URL on startup.
+
+### Webhook service (production path)
+
+```bash
+uv run uvicorn serve:app --host 0.0.0.0 --port 8000
+```
+
+Endpoints:
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/health` | Liveness check |
+| `POST` | `/webhook/jira` | Jira `jira:issue_created` webhook |
+
+Configure a Jira webhook (Settings → System → WebHooks) pointing at `$WEBHOOK_PUBLIC_URL/webhook/jira` (see **Local dev with ngrok** above) for **Issue created** events.
+
+Optional: set `JIRA_WEBHOOK_SECRET` in Jira (**Settings → System → WebHooks → Secret**)
+and the same value in `.env`. Jira signs each delivery with `X-Hub-Signature: sha256=...`.
+
+### Manual / script triage
+
+```python
+from runner import process_ticket
+
+result = process_ticket("HELIX-123", "How many vacation days do I have?")
+print(result.final_decision)
+```
+
+### Evaluation harness
+
+```bash
+uv run python -m eval.run_eval --output eval/results.csv
+```
+
+Runs all 50 assignment tickets (no Jira writes — uses `triage_ticket` internally via the runner's agent path). Options: `--limit N`, `--ids T-001,T-026`.
+
+## 5. Prompt Strategy
 
 The system prompt has two parts:
 
 1. **Knowledge base** — all 10 policies / 60 clauses rendered with exact citation ids (`POL-01 §1.4`). The model must copy citations verbatim; no prior knowledge allowed.
 2. **Triage instructions** — when to RESOLVE vs DEFER, all 12 defer reason codes, and critical judgment rules (active incidents, prompt injection, privileged access, etc.).
 
-The user message is the ticket body text.
+The user message is the ticket body text (summary + description from the Jira webhook).
 
 The agent returns a discriminated union:
 - **RESOLVE** — `action`, `answer`, `citations` (required, min 1)
 - **DEFER** — `action`, `answer`, `reason_code`, optional `citations`
 
-## 4. Grounding
+## 6. Grounding
 
 Grounding is enforced in layers:
 
@@ -91,19 +182,25 @@ Grounding is enforced in layers:
 | Prompt | Done | "Only use Knowledge base"; defer when unsure |
 | Full corpus | Done | All clauses always in context |
 | Pydantic schema | Done | Invalid RESOLVE/DEFER combinations rejected at parse time |
-| Gate 1: citation exists | Planned | `get_section()` lookup before Jira write |
-| Gate 2: faithfulness | Planned | Verify answer is entailed by cited clause text |
+| Gate 1: citation exists | Done | `get_section()` lookup before Jira write; fail closed to DEFER |
+| Gate 2: faithfulness | Deferred | Optional LLM entailment check — add if eval shows false RESOLVEs |
 
-Jira writes happen only in `runner.process_ticket` → `handle_ticket`, never inside the LLM loop. This keeps grounding gates fail-closed: a bad RESOLVE is blocked before it reaches the board.
+Jira writes happen only in `runner.process_ticket` → `handle_ticket`, never inside the LLM loop.
 
-## 5. Evaluation
+## 7. Evaluation
 
-1. **Correctness** — Does the agent resolve the right tickets and defer the right ones?
-2. **Grounding** — Are answers traceable to a specific policy section?
-3. **Judgement** — Does it recognize out-of-scope, ambiguous, or sensitive tickets?
+The eval set (`tests/fixtures/eval_tickets.py`) contains all 50 assignment tickets with ground-truth RESOLVE citations and DEFER reason codes.
 
-*(Eval harness over the 50 assignment tickets — planned.)*
+Metrics (`eval/metrics.py`):
 
-## 6. Useful Links
+- **RESOLVE accuracy** — correct action + expected citations present
+- **DEFER accuracy** — correct action + reason code match
+- **Weighted errors** — missed RESOLVE + 3× false RESOLVE (per assignment rubric)
 
+Run locally and inspect `eval/results.csv` for per-ticket agent vs final (post-gate) columns.
+
+## 8. Useful Links
+
+- [Gemini API pricing](https://ai.google.dev/gemini-api/docs/pricing)
+- [Gemini API rate limits](https://ai.google.dev/gemini-api/docs/rate-limits)
 - Mermaid Charts in Markdown: https://www.markdownlang.com/advanced/diagrams.html

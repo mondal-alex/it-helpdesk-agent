@@ -6,6 +6,7 @@ tooling. RESOLVE and DEFER are separate Pydantic models so invalid combinations
 """
 
 import re
+from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal, Sequence, Union
 
@@ -73,6 +74,13 @@ class Citation(BaseModel):
                     '(e.g. "POL-01 §1.4").'
                 )
             return {"policy_id": match.group(1), "section": match.group(2)}
+        if isinstance(value, dict):
+            section = value.get("section")
+            if isinstance(section, str):
+                return {
+                    **value,
+                    "section": section.removeprefix("§").strip(),
+                }
         return value
 
     def __str__(self) -> str:
@@ -155,3 +163,16 @@ def format_ticket_comment(decision: TicketDecision) -> str:
     lines.append("")
     lines.append(decision.answer)
     return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class TicketTriageResult:
+    """Raw agent output plus the gated decision posted to Jira."""
+
+    ticket_id: str
+    agent_decision: TicketDecision
+    final_decision: TicketDecision
+
+    @property
+    def gate_overridden(self) -> bool:
+        return self.agent_decision.model_dump() != self.final_decision.model_dump()
