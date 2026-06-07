@@ -60,7 +60,7 @@ def _build_model() -> str | BaseChatModel:
             types.HarmBlockThreshold.BLOCK_ONLY_HIGH
         ),
         types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: (
-            types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+            types.HarmBlockThreshold.BLOCK_NONE
         ),
     }
 

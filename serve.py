@@ -19,8 +19,8 @@ from pydantic import BaseModel, Field
 from eval.live_progress import live_progress
 from eval.report import lookup_eval_ticket, record_live_result
 from logging_config import configure_logging
-from models import DeferDecision, ResolveDecision
-from runner import process_ticket
+from models import DeferDecision, ResolveDecision, TicketTriageResult
+from runner import _triage_fallback_decision, process_ticket
 
 logger = logging.getLogger(__name__)
 
@@ -180,8 +180,26 @@ def _run_pipeline(issue_key: str, body: str) -> None:
         _record_live_eval(issue_key, body, result)
         progress.finished(issue_key, body, action=summary.action, success=True)
     except Exception:
-        progress.finished(issue_key, body, action="ERROR", success=False)
         logger.exception("Failed to process Jira issue %s", issue_key)
+        _record_live_eval_fallback(issue_key, body)
+        progress.finished(issue_key, body, action="ERROR", success=False)
+
+
+def _record_live_eval_fallback(issue_key: str, body: str) -> None:
+    """Best-effort CSV row when triage fails so bulk demos still reach N/N."""
+    ticket = lookup_eval_ticket(body)
+    if ticket is None:
+        return
+    fallback = _triage_fallback_decision(body)
+    result = TicketTriageResult(
+        ticket_id=ticket.id,
+        agent_decision=fallback,
+        final_decision=fallback,
+    )
+    try:
+        record_live_result(issue_key, body, result)
+    except Exception:
+        logger.exception("Failed to write fallback live eval report for %s", issue_key)
 
 
 def _record_live_eval(issue_key: str, body: str, result) -> None:

@@ -20,7 +20,7 @@ from models import (
     TicketTriageResult,
 )
 from policies.yaml_policy_retriever import YAMLPolicyRetriever
-from rate_limit import run_with_llm_retry
+from rate_limit import bulk_mode_enabled, run_with_llm_retry
 from tools import handle_ticket, mark_triage_failed, mark_under_agent_review
 
 logger = logging.getLogger(__name__)
@@ -32,6 +32,77 @@ _SAFETY_BLOCK_FALLBACK_ANSWER = (
     "This looks like an active security incident in progress. "
     "Contact the SOC immediately — do not wait for email follow-up."
 )
+_LOW_CONFIDENCE_FALLBACK_ANSWER = (
+    "I could not confidently determine the right policy answer from this ticket. "
+    "A human reviewer will follow up."
+)
+_SECURITY_INCIDENT_HINTS = (
+    "phishing",
+    "clicked a link",
+    "entered my password",
+    "strange popups",
+    "ransomware",
+    "malware",
+    "mfa push",
+    "log in as me",
+    "breach",
+    "hacked",
+    "bitcoin",
+    "files won't open",
+    "active attack",
+)
+
+
+def _format_retry_max_attempts() -> int:
+    """Cap paid re-invokes when Gemini returns malformed structured output."""
+    default = "2" if bulk_mode_enabled() else "3"
+    return int(os.getenv("TRIAGE_FORMAT_MAX_ATTEMPTS", default))
+
+
+def _looks_like_security_incident(body: str) -> bool:
+    text = body.casefold()
+    return any(hint in text for hint in _SECURITY_INCIDENT_HINTS)
+
+
+def _triage_fallback_decision(body: str, *, safety_block: bool = False) -> DeferDecision:
+    """Fail closed so webhook triage always completes."""
+    if safety_block or _looks_like_security_incident(body):
+        return DeferDecision(
+            answer=_SAFETY_BLOCK_FALLBACK_ANSWER,
+            reason_code=DeferReasonCode.ACTIVE_INCIDENT,
+        )
+    return DeferDecision(
+        answer=_LOW_CONFIDENCE_FALLBACK_ANSWER,
+        reason_code=DeferReasonCode.LOW_CONFIDENCE,
+    )
+
+
+def _log_triage_fallback(
+    ticket_id: str,
+    *,
+    started: float,
+    trigger: str,
+    decision: DeferDecision,
+) -> None:
+    elapsed_ms = (time.perf_counter() - started) * 1000
+    logger.warning(
+        "LLM triage fallback on %s (%s) -> %s",
+        ticket_id,
+        trigger,
+        decision.reason_code.value,
+    )
+    logger.info(
+        "LLM triage ticket=%s model=%s elapsed_ms=%.0f "
+        "input_tokens=%s output_tokens=%s total_tokens=%s "
+        "fallback=%s",
+        ticket_id,
+        os.getenv("MODEL", "unknown"),
+        elapsed_ms,
+        None,
+        None,
+        None,
+        decision.reason_code.value,
+    )
 
 
 def _iter_exception_chain(exc: BaseException):
@@ -74,12 +145,12 @@ def _is_llm_safety_block(exc: BaseException) -> bool:
     return False
 
 
-def _safety_block_fallback_decision() -> DeferDecision:
-    """Fail closed when the model refuses to answer security-incident tickets."""
-    return DeferDecision(
-        answer=_SAFETY_BLOCK_FALLBACK_ANSWER,
-        reason_code=DeferReasonCode.ACTIVE_INCIDENT,
-    )
+def _invoke_fallback_trigger(exc: BaseException) -> str | None:
+    if _is_llm_safety_block(exc):
+        return "safety_block"
+    if isinstance(exc, StructuredOutputValidationError):
+        return "structured_output_parse"
+    return None
 
 
 def process_ticket(jira_issue_id: str, body: str) -> TicketTriageResult:
@@ -176,7 +247,7 @@ def _triage_ticket(ticket_id: str, body: str) -> TicketDecision:
         return AGENT.invoke({"messages": [("user", body.strip())]})
 
     started = time.perf_counter()
-    max_attempts = int(os.getenv("API_RETRY_MAX_ATTEMPTS", "5"))
+    max_attempts = _format_retry_max_attempts()
     result: dict | None = None
     decision: TicketDecision | None = None
 
@@ -184,31 +255,32 @@ def _triage_ticket(ticket_id: str, body: str) -> TicketDecision:
         try:
             result = run_with_llm_retry(invoke)
         except Exception as exc:
-            if _is_llm_safety_block(exc):
-                elapsed_ms = (time.perf_counter() - started) * 1000
-                logger.warning(
-                    "LLM safety block on %s; deferring as ACTIVE_INCIDENT",
-                    ticket_id,
+            trigger = _invoke_fallback_trigger(exc)
+            if trigger is not None:
+                fallback = _triage_fallback_decision(
+                    body,
+                    safety_block=trigger == "safety_block",
                 )
-                logger.info(
-                    "LLM triage ticket=%s model=%s elapsed_ms=%.0f "
-                    "input_tokens=%s output_tokens=%s total_tokens=%s "
-                    "fallback=ACTIVE_INCIDENT",
+                _log_triage_fallback(
                     ticket_id,
-                    os.getenv("MODEL", "unknown"),
-                    elapsed_ms,
-                    None,
-                    None,
-                    None,
+                    started=started,
+                    trigger=trigger,
+                    decision=fallback,
                 )
-                return _safety_block_fallback_decision()
+                return fallback
             raise
 
         structured = result.get("structured_response")
         if structured is None:
-            error = ValueError("Agent did not return a structured decision")
             if attempt >= max_attempts - 1:
-                raise error
+                fallback = _triage_fallback_decision(body)
+                _log_triage_fallback(
+                    ticket_id,
+                    started=started,
+                    trigger="missing_structured",
+                    decision=fallback,
+                )
+                return fallback
             logger.warning(
                 "Missing structured decision; retrying (%s/%s)",
                 attempt + 1,
@@ -221,7 +293,14 @@ def _triage_ticket(ticket_id: str, body: str) -> TicketDecision:
             break
         except ValidationError:
             if attempt >= max_attempts - 1:
-                raise
+                fallback = _triage_fallback_decision(body)
+                _log_triage_fallback(
+                    ticket_id,
+                    started=started,
+                    trigger="validation_exhausted",
+                    decision=fallback,
+                )
+                return fallback
             logger.warning(
                 "Invalid structured decision; retrying (%s/%s)",
                 attempt + 1,

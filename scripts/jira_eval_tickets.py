@@ -133,18 +133,19 @@ def create_issue(project_key: str, issue_type: str, ticket: EvalTicket) -> str:
 
 
 def search_issue_keys(project_key: str, label: str) -> list[str]:
-    url = f"{_jira_base_url()}/rest/api/3/search"
-    jql = f'project = "{project_key}" AND labels = "{label}" ORDER BY key ASC'
+    url = f"{_jira_base_url()}/rest/api/3/search/jql"
+    jql = f'project = {project_key} AND labels = "{label}" ORDER BY key ASC'
     keys: list[str] = []
-    start_at = 0
+    next_page_token: str | None = None
 
     while True:
-        payload = {
+        payload: dict[str, object] = {
             "jql": jql,
-            "startAt": start_at,
             "maxResults": 100,
             "fields": ["key"],
         }
+        if next_page_token:
+            payload["nextPageToken"] = next_page_token
         response = jira_request(
             "POST",
             url,
@@ -163,8 +164,8 @@ def search_issue_keys(project_key: str, label: str) -> list[str]:
         for issue in issues:
             keys.append(str(issue["key"]))
 
-        start_at += len(issues)
-        if start_at >= int(data.get("total", 0)) or not issues:
+        next_page_token = data.get("nextPageToken")
+        if not next_page_token:
             break
 
     return keys

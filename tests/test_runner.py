@@ -103,11 +103,54 @@ def test_is_llm_safety_block_ignores_non_empty_json_errors():
     assert _is_llm_safety_block(exc) is False
 
 
+def _malformed_structured_output_error() -> StructuredOutputValidationError:
+    source = ValueError(
+        "Native structured output expected valid JSON for response_format, "
+        "but parsing failed: Expecting value: line 2 column 1171169 (char 1171526)."
+    )
+    source.__cause__ = json.JSONDecodeError("Expecting value", '{"action":', 12)
+    return StructuredOutputValidationError(
+        "response_format",
+        source,
+        AIMessage(content="garbage"),
+    )
+
+
 @patch("runner.AGENT")
 def test_triage_ticket_safety_block_returns_active_incident_defer(mock_agent):
     mock_agent.invoke.side_effect = _empty_structured_output_error()
 
-    decision = _triage_ticket("T-029", "phishing ticket body")
+    decision = _triage_ticket(
+        "T-029",
+        "I clicked a link in a weird email and entered my password.",
+    )
 
     assert isinstance(decision, DeferDecision)
     assert decision.reason_code == DeferReasonCode.ACTIVE_INCIDENT
+
+
+@patch("runner.AGENT")
+def test_triage_ticket_malformed_output_returns_low_confidence_defer(mock_agent):
+    mock_agent.invoke.side_effect = _malformed_structured_output_error()
+
+    decision = _triage_ticket("T-045", "Is what I'm doing allowed?")
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reason_code == DeferReasonCode.LOW_CONFIDENCE
+
+
+@patch("runner.AGENT")
+def test_triage_ticket_validation_exhaustion_returns_low_confidence_defer(mock_agent):
+    mock_agent.invoke.return_value = {
+        "structured_response": {
+            "action": "Defer",
+            "answer": "unsure",
+            "reason_code": "NOT_A_REAL_CODE",
+        },
+        "messages": [],
+    }
+
+    decision = _triage_ticket("T-045", "Is what I'm doing allowed?")
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reason_code == DeferReasonCode.LOW_CONFIDENCE
