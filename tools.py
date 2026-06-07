@@ -12,14 +12,14 @@ from models import TicketAction, TicketDecision, format_ticket_comment
 
 load_dotenv()
 
-_MANUAL_REVIEW_LABEL = "needs-manual-review"
+_DEFER_LABEL = "defer"
 _RESOLVED_LABEL = "resolved"
 
 _JIRA_ENV_VARS = (
     "JIRA_DOMAIN",
     "JIRA_EMAIL",
     "JIRA_API_TOKEN",
-    "MANUAL_REVIEW_COLUMN_STATUS",
+    "DEFER_COLUMN_STATUS",
     "RESOLVED_COLUMN_STATUS",
 )
 
@@ -79,8 +79,8 @@ def handle_ticket(
 def _match(ticket_action: TicketAction) -> Tuple[str, str]:
     """Match a ticket action to a Jira column status and label."""
     match ticket_action:
-        case TicketAction.NEEDS_MANUAL_REVIEW:
-            return (_require_env("MANUAL_REVIEW_COLUMN_STATUS"), _MANUAL_REVIEW_LABEL)
+        case TicketAction.DEFER:
+            return (_require_env("DEFER_COLUMN_STATUS"), _DEFER_LABEL)
         case TicketAction.RESOLVED:
             return (_require_env("RESOLVED_COLUMN_STATUS"), _RESOLVED_LABEL)
 

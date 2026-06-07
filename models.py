@@ -26,7 +26,7 @@ _CITATION_RE = re.compile(r"^(POL-\d{2}) §(\d+(?:\.\d+)*)$")
 class TicketAction(StrEnum):
     """Disposition applied to a Jira ticket."""
 
-    NEEDS_MANUAL_REVIEW = "Needs Manual Review"
+    DEFER = "Defer"
     RESOLVED = "Resolved"
 
 
@@ -98,7 +98,7 @@ class ResolveDecision(_DecisionBase):
 class DeferDecision(_DecisionBase):
     """Defer a ticket to a human with a standardized reason code."""
 
-    action: Literal[TicketAction.NEEDS_MANUAL_REVIEW] = TicketAction.NEEDS_MANUAL_REVIEW
+    action: Literal[TicketAction.DEFER] = TicketAction.DEFER
     answer: str = Field(min_length=1)
     reason_code: DeferReasonCode
     citations: CitationList = Field(default_factory=list)
@@ -126,7 +126,7 @@ def build_ticket_decision(
         if reason_code is not None:
             raise ValueError("RESOLVE decisions must not include a reason_code")
         return ResolveDecision(answer=answer, citations=list(citations or []))
-    if action == TicketAction.NEEDS_MANUAL_REVIEW:
+    if action == TicketAction.DEFER:
         if reason_code is None:
             raise ValueError("DEFER decisions require a reason_code")
         return DeferDecision(
