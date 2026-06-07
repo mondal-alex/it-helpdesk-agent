@@ -2,87 +2,107 @@
 
 ## 1. Project Overview
 
-This agent resolves IT Help Desk Tickets stored in a Jira Kanban board. To resolve a ticket, the agent references a set of policies. If the agent cannot find a relevant policy to resolve the ticket with 100% certainty, it marks the ticket for human review.
+This agent resolves IT Help Desk tickets stored in a Jira Kanban board. To resolve a ticket, it references a fixed set of Helix IT policies. If it cannot answer from those policies with full confidence, it defers the ticket to a human with a standardized reason code.
 
-The agent is powered by AI and is built following the ReACT framework (Reasoning and Action). First, it reasons in a chain-of-thought style. Second, it decides if it needs to take an action (seaching for a policy or a tool call). It proceeds in this loop until it reaches a conclusion.
+The LLM triages each ticket by returning a **structured decision** (`ResolveDecision` or `DeferDecision`). It does **not** call Jira directly. Application code in `runner.py` applies the decision after validation — keeping side effects deterministic and leaving room for grounding gates before anything is posted.
 
 ## 2. Architecture
 
 ### 2.1 Overview
 
-The AI agent itself is implemented using LangChain. It has a set of tools that use the Atlassian API to interact with the Jira board. It uses a vector store with metadata to retrieve relevant policies to the inquiry. It's prompt is engineered to safeguard against uncertainty.
+| Layer | Module | Role |
+|-------|--------|------|
+| Prompt | `prompt.py` | Full policy corpus in system prompt + triage rules |
+| Agent | `agent.py` | LangChain agent with `response_format=DecisionUnion` (no tools) |
+| Runner | `runner.py` | Orchestrates triage → validation → Jira |
+| Models | `models.py` | Pydantic RESOLVE/DEFER contract, citations, comment formatting |
+| Policies | `policies/` | `policies.yaml` + retriever interface (full-corpus baseline) |
+| Jira | `tools.py` | `handle_ticket(id, decision)` — comment, label, transition |
 
-The agent runs inside of a FastAPI server. The server listens to a Jira Webhook to check if a new ticket was posed to the IT Help Desk Jira board. If a ticket is posted, the agent ingests, evaluates and acts on the ticket.
+The agent uses a **full-corpus grounding strategy**: all 60 policy clauses (~2.8k tokens) are rendered into the system prompt. At this corpus size, retrieval recall beats top-k RAG; the `PolicyRetrieverInterface` seam allows a vector/hybrid retriever later without changing the runner.
 
-### 2.2 Mermaid Diagrams
+A FastAPI webhook listener (`serve.py`, planned) will receive new Jira tickets and call `runner.process_ticket`.
 
-### 2.2.1 High-Level Sequence Diagram
-
+### 2.2 Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    participant A as IT Ticket
-    participant B as Server Backend (FastAPI)
-    participant C as Agent (Langchain)
-    participant D as Vector DB
+    participant J as Jira Ticket
+    participant S as Server (FastAPI)
+    participant R as runner.py
+    participant A as Agent (LangChain)
+    participant G as Grounding Gates
+    participant API as Jira API
 
-    A->>B: Ingest ticket.
-    B->>C: Info Sent to Agent.
-    C->>D: Reference relevant policies.
-    D->>C: Apply policies to inquiry.
-    C->>B: Send response.
-    B->>A: Update ticket.
-
-    Note over A,D: Flow complete.
+    J->>S: Webhook (new ticket)
+    S->>R: process_ticket(id, body)
+    R->>A: invoke (system prompt + ticket)
+    Note over A: Full policy corpus in context
+    A->>R: ResolveDecision | DeferDecision
+    R->>G: validate citations / faithfulness
+    G->>R: pass or force DEFER
+    R->>API: handle_ticket(id, decision)
+    API->>J: comment + label + transition
 ```
 
-### 2.2.2 Detailed Flow Chart
+### 2.3 Decision Flow
 
 ```mermaid
-flowchart LR
-    S([START]) --> A[Jira Ticket]
-    A --> B[Webhook]
-    B --> C[FastAPI]
-    C --> D[Listener]
-    D --> E[Prompt]
-    E --> F[Agent]
-    F --> H[POST Changes]
-    H --> A
-
-flowchart LR
-    F[Agent] --> G[CoT]
-    G --> H[Policy Retrieval]
-    H --> K[(Vector DB)]
-    K --> H
-    H --> G
-    G --> I[Edit Ticket]
-    I --> M[Jira API]
-    M --> I
-    I --> J([END])
+flowchart TD
+    S([START]) --> T[Jira ticket ingested]
+    T --> P[System prompt + full policy corpus]
+    P --> A[LLM structured output]
+    A --> D{RESOLVE or DEFER?}
+    D -->|RESOLVE| G1[Gate 1: citation exists]
+    D -->|DEFER| G1
+    G1 --> G2[Gate 2: faithfulness check]
+    G2 --> J[handle_ticket → Jira API]
+    J --> E([END])
 ```
 
-
-
-
-### 2.3 Python Dependencies (Direct)
+### 2.4 Python Dependencies (Direct)
 
 | Name | Tag | Reason |
 |------|-----|--------|
-| Langchain | `langchain` | Agent development and deployment |
-| FastAPI   | `fastapi` | Serve the agent and listen to Jira webhooks |
-| Jira | `jira` | Resolve, label and comment on tickets in the Jira board |
-
+| LangChain | `langchain` | Agent with structured output |
+| Pydantic | `pydantic` | RESOLVE/DEFER decision models |
+| python-dotenv | `python-dotenv` | Environment configuration |
+| requests | (via LangChain deps) | Jira REST API calls |
 
 ## 3. Prompt Strategy
 
+The system prompt has two parts:
+
+1. **Knowledge base** — all 10 policies / 60 clauses rendered with exact citation ids (`POL-01 §1.4`). The model must copy citations verbatim; no prior knowledge allowed.
+2. **Triage instructions** — when to RESOLVE vs DEFER, all 12 defer reason codes, and critical judgment rules (active incidents, prompt injection, privileged access, etc.).
+
+The user message is the ticket body text.
+
+The agent returns a discriminated union:
+- **RESOLVE** — `action`, `answer`, `citations` (required, min 1)
+- **DEFER** — `action`, `answer`, `reason_code`, optional `citations`
+
 ## 4. Grounding
 
-## 5. Evaluation:
+Grounding is enforced in layers:
 
-1. Correctness - Does the agent resolve the right tickets, and leave the right ones alone?
-2. Grounding - Are answers traceable to a specific policy section, or does it hallucinate?
-3. Judgement - Does it recognize when a ticket is out of scope, ambiguous or sensitive?
+| Layer | Status | Mechanism |
+|-------|--------|-----------|
+| Prompt | Done | "Only use Knowledge base"; defer when unsure |
+| Full corpus | Done | All clauses always in context |
+| Pydantic schema | Done | Invalid RESOLVE/DEFER combinations rejected at parse time |
+| Gate 1: citation exists | Planned | `get_section()` lookup before Jira write |
+| Gate 2: faithfulness | Planned | Verify answer is entailed by cited clause text |
 
+Jira writes happen only in `runner.process_ticket` → `handle_ticket`, never inside the LLM loop. This keeps grounding gates fail-closed: a bad RESOLVE is blocked before it reaches the board.
+
+## 5. Evaluation
+
+1. **Correctness** — Does the agent resolve the right tickets and defer the right ones?
+2. **Grounding** — Are answers traceable to a specific policy section?
+3. **Judgement** — Does it recognize out-of-scope, ambiguous, or sensitive tickets?
+
+*(Eval harness over the 50 assignment tickets — planned.)*
 
 ## 6. Useful Links
 

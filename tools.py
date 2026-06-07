@@ -1,25 +1,14 @@
-"""Tools for the agent.
-
-TODO: Add observability and logging rather than print statements for errors.
-TODO: Handle partial side effects in handle_ticket.
-TODO: Return value for tool?
-"""
+"""Jira integration for applying ticket triage decisions."""
 
 import json
 import os
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import requests
 from dotenv import load_dotenv
-from langchain.tools import tool
 from requests.auth import HTTPBasicAuth
 
-from models import (
-    DeferReasonCode,
-    TicketAction,
-    build_ticket_decision,
-    format_ticket_comment,
-)
+from models import TicketAction, TicketDecision, format_ticket_comment
 
 load_dotenv()
 
@@ -58,41 +47,18 @@ def _jira_auth() -> HTTPBasicAuth:
     return HTTPBasicAuth(_require_env("JIRA_EMAIL"), _require_env("JIRA_API_TOKEN"))
 
 
-######### 1. TOOLS ##############
-
-
-@tool
 def handle_ticket(
     jira_issue_id: str,
-    ticket_action: TicketAction,
-    answer: str,
-    citations: Optional[List[str]] = None,
-    reason_code: Optional[DeferReasonCode] = None,
+    decision: TicketDecision,
 ) -> None:
-    """Resolve or defer a Jira ticket: post comment, add label, transition status.
-
-    For RESOLVED, provide one or more policy citations (e.g. ``POL-01 §1.4``).
-    For NEEDS_MANUAL_REVIEW, provide a ``reason_code`` from the standard defer list.
-    """
-    decision = build_ticket_decision(
-        ticket_action,
-        answer,
-        citations=citations,
-        reason_code=reason_code,
-    )
+    """Apply a triage decision to Jira: post comment, add label, transition status."""
     comment = format_ticket_comment(decision)
-    status, label = _match(ticket_action)
+    status, label = _match(decision.action)
 
-    # 1. Post the comment.
     _post_comment(jira_issue_id, comment)
-
-    # 2. Label the ticket.
     _add_label_to_issue(jira_issue_id, label)
 
-    # 3. Get available transitions.
     transitions = _get_available_transitions(jira_issue_id)
-
-    # 4. Get the transition ID for the destination name.
     transition_id = next(
         (t["id"] for t in transitions if t["to"]["name"] == status),
         None,
@@ -107,14 +73,7 @@ def handle_ticket(
             "workflow state allows transitioning to it."
         )
 
-    # 5. Transition the ticket to the available column.
     _transition_to_destination(jira_issue_id, destination_id=transition_id)
-
-
-ALL_TOOLS = [handle_ticket]
-
-
-######### 2. HELPER FUNCTIONS #############
 
 
 def _match(ticket_action: TicketAction) -> Tuple[str, str]:

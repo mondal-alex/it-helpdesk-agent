@@ -104,8 +104,12 @@ class DeferDecision(_DecisionBase):
     citations: CitationList = Field(default_factory=list)
 
 
+# Plain union for LangChain ``response_format`` (no Annotated wrapper).
+DecisionUnion = ResolveDecision | DeferDecision
+
+# Discriminated union on ``action`` — use for app-layer typing and validation.
 TicketDecision = Annotated[
-    Union[ResolveDecision, DeferDecision],
+    DecisionUnion,
     Field(discriminator="action"),
 ]
 
@@ -116,7 +120,7 @@ def build_ticket_decision(
     *,
     citations: Sequence[str] | None = None,
     reason_code: DeferReasonCode | None = None,
-) -> ResolveDecision | DeferDecision:
+) -> TicketDecision:
     """Build a validated decision from flat agent/tool inputs."""
     if action == TicketAction.RESOLVED:
         if reason_code is not None:
@@ -133,7 +137,7 @@ def build_ticket_decision(
     raise ValueError(f"Unknown action: {action!r}")
 
 
-def format_ticket_comment(decision: ResolveDecision | DeferDecision) -> str:
+def format_ticket_comment(decision: TicketDecision) -> str:
     """Format a structured decision as a stable, grep-friendly Jira comment."""
     lines: list[str] = []
 
