@@ -8,6 +8,7 @@ from agent import AGENT
 from grounding import apply_grounding_gates
 from models import DeferDecision, ResolveDecision, TicketDecision, TicketTriageResult
 from policies.yaml_policy_retriever import YAMLPolicyRetriever
+from rate_limit import run_with_llm_retry
 from tools import handle_ticket, mark_under_agent_review
 
 logger = logging.getLogger(__name__)
@@ -46,7 +47,11 @@ def triage_ticket(ticket_id: str, body: str) -> TicketTriageResult:
 
 def _triage_ticket(body: str) -> TicketDecision:
     """Run the agent on a ticket body and return its structured decision."""
-    result = AGENT.invoke({"messages": [("user", body.strip())]})
+
+    def invoke() -> dict:
+        return AGENT.invoke({"messages": [("user", body.strip())]})
+
+    result = run_with_llm_retry(invoke)
     structured = result.get("structured_response")
     if structured is None:
         raise ValueError("Agent did not return a structured decision")

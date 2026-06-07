@@ -29,7 +29,7 @@ if ! command -v ngrok >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Jira webhook URL: ${PUBLIC_URL%/}/webhook/jira"
+echo "Jira webhook URL: ${PUBLIC_URL%/}/rest/webhooks/jira"
 echo "Starting uvicorn on 0.0.0.0:${PORT} ..."
 
 uv run uvicorn serve:app --host 0.0.0.0 --port "$PORT" &

@@ -1,4 +1,5 @@
 .env
 eval/results.csv
+eval/seeded_jira_issues.json
 __pycache__/
 .pytest_cache/

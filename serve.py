@@ -21,6 +21,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 _ISSUE_CREATED = "jira:issue_created"
+JIRA_WEBHOOK_PATH = "/rest/webhooks/jira"
 _WEBHOOK_SECRET = os.getenv("JIRA_WEBHOOK_SECRET", "").strip()
 _HUB_SIGNATURE_PREFIX = "sha256="
 
@@ -174,7 +175,7 @@ def health() -> HealthResponse:
     return HealthResponse()
 
 
-@app.post("/webhook/jira", response_model=WebhookAccepted)
+@app.post(JIRA_WEBHOOK_PATH, response_model=WebhookAccepted)
 async def jira_webhook(
     request: Request,
     background_tasks: BackgroundTasks,

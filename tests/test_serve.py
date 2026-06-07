@@ -1,6 +1,12 @@
 """Unit tests for Jira webhook parsing and signature verification."""
 
-from serve import extract_ticket_body, parse_jira_webhook, verify_jira_webhook_signature
+from serve import (
+    JIRA_WEBHOOK_PATH,
+    app,
+    extract_ticket_body,
+    parse_jira_webhook,
+    verify_jira_webhook_signature,
+)
 
 
 def test_parse_issue_created_webhook():
@@ -74,3 +80,8 @@ def test_verify_jira_webhook_signature_rejects_invalid():
 
 def test_verify_jira_webhook_signature_skips_when_no_secret():
     assert verify_jira_webhook_signature(b"anything", None, "") is True
+
+
+def test_jira_webhook_route_registered():
+    paths = {route.path for route in app.routes if hasattr(route, "path")}
+    assert JIRA_WEBHOOK_PATH in paths

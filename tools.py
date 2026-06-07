@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 from requests.auth import HTTPBasicAuth
 
 from models import TicketAction, TicketDecision, format_ticket_comment
+from rate_limit import jira_request
 
 load_dotenv()
 
@@ -69,13 +70,33 @@ def handle_ticket(
     transition_issue_to_status(jira_issue_id, status)
 
 
+def _normalize_status_name(name: str) -> str:
+    """Normalize a Jira status name for case-insensitive comparison."""
+    return name.casefold().strip()
+
+
+def _find_transition_id(transitions: List[dict], status_name: str) -> str | None:
+    """Return a transition id for status_name (exact match, then case-insensitive)."""
+    target = _normalize_status_name(status_name)
+    case_insensitive_match: str | None = None
+
+    for transition in transitions:
+        destination_name = transition["to"]["name"]
+        if destination_name == status_name:
+            return transition["id"]
+        if (
+            case_insensitive_match is None
+            and _normalize_status_name(destination_name) == target
+        ):
+            case_insensitive_match = transition["id"]
+
+    return case_insensitive_match
+
+
 def transition_issue_to_status(issue_id: str, status_name: str) -> None:
-    """Move an issue to a workflow status by exact Jira status name."""
+    """Move an issue to a workflow status by Jira status name."""
     transitions = _get_available_transitions(issue_id)
-    transition_id = next(
-        (t["id"] for t in transitions if t["to"]["name"] == status_name),
-        None,
-    )
+    transition_id = _find_transition_id(transitions, status_name)
 
     if not transition_id:
         available = [t["to"]["name"] for t in transitions]
@@ -120,7 +141,8 @@ def _post_comment(issue_id: str, comment: str) -> None:
     }
     payload = json.dumps({"body": _comment_adf_body(comment)})
 
-    response = requests.post(
+    response = jira_request(
+        "POST",
         url,
         data=payload,
         headers=headers,
@@ -138,7 +160,9 @@ def _get_available_transitions(issue_id: str) -> List[dict]:
     url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}/transitions"
     headers = {"Accept": "application/json"}
 
-    response = requests.get(url, headers=headers, auth=_jira_auth(), timeout=10)
+    response = jira_request(
+        "GET", url, headers=headers, auth=_jira_auth(), timeout=10
+    )
     if response.status_code != 200:
         raise requests.HTTPError(
             f"Error fetching transitions: status {response.status_code}: {response.text}"
@@ -156,7 +180,8 @@ def _transition_to_destination(issue_id: str, destination_id: str) -> None:
     }
     payload = json.dumps({"transition": {"id": destination_id}})
 
-    response = requests.post(
+    response = jira_request(
+        "POST",
         url,
         data=payload,
         headers=headers,
@@ -178,7 +203,8 @@ def _add_label_to_issue(issue_id: str, label: str) -> None:
     }
     payload = json.dumps({"update": {"labels": [{"add": label}]}})
 
-    response = requests.put(
+    response = jira_request(
+        "PUT",
         url,
         data=payload,
         headers=headers,
