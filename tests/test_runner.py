@@ -1,9 +1,18 @@
 """Unit tests for runner pipeline result (no LLM required)."""
 
+import json
 from unittest.mock import patch
 
+from langchain.agents.structured_output import StructuredOutputValidationError
+from langchain_core.messages import AIMessage
+
 from models import DeferDecision, DeferReasonCode, ResolveDecision
-from runner import process_ticket, triage_ticket
+from runner import (
+    _is_llm_safety_block,
+    _triage_ticket,
+    process_ticket,
+    triage_ticket,
+)
 
 
 @patch("runner._triage_ticket")
@@ -68,3 +77,37 @@ def test_process_ticket_marks_failed_and_reraises_on_error(
     mock_in_review.assert_called_once_with("JIRA-1")
     mock_handle.assert_not_called()
     mock_mark_failed.assert_called_once_with("JIRA-1")
+
+
+def _empty_structured_output_error() -> StructuredOutputValidationError:
+    source = ValueError(
+        "Native structured output expected valid JSON for response_format, "
+        "but parsing failed: Expecting value: line 1 column 1 (char 0)."
+    )
+    source.__cause__ = json.JSONDecodeError("Expecting value", "", 0)
+    return StructuredOutputValidationError(
+        "response_format",
+        source,
+        AIMessage(content=""),
+    )
+
+
+def test_is_llm_safety_block_detects_empty_structured_output():
+    assert _is_llm_safety_block(_empty_structured_output_error()) is True
+
+
+def test_is_llm_safety_block_ignores_non_empty_json_errors():
+    exc = ValueError("invalid json")
+    exc.__cause__ = json.JSONDecodeError("Expecting property name", "{bad", 1)
+
+    assert _is_llm_safety_block(exc) is False
+
+
+@patch("runner.AGENT")
+def test_triage_ticket_safety_block_returns_active_incident_defer(mock_agent):
+    mock_agent.invoke.side_effect = _empty_structured_output_error()
+
+    decision = _triage_ticket("T-029", "phishing ticket body")
+
+    assert isinstance(decision, DeferDecision)
+    assert decision.reason_code == DeferReasonCode.ACTIVE_INCIDENT

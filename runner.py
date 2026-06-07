@@ -1,16 +1,24 @@
 """Orchestrate agent triage and Jira updates."""
 
+import json
 import logging
 import os
 import time
 from typing import Any
 
+from langchain.agents.structured_output import StructuredOutputValidationError
 from langchain_core.messages import AIMessage
 from pydantic import TypeAdapter, ValidationError
 
 from agent import AGENT
 from grounding import apply_grounding_gates
-from models import DeferDecision, ResolveDecision, TicketDecision, TicketTriageResult
+from models import (
+    DeferDecision,
+    DeferReasonCode,
+    ResolveDecision,
+    TicketDecision,
+    TicketTriageResult,
+)
 from policies.yaml_policy_retriever import YAMLPolicyRetriever
 from rate_limit import run_with_llm_retry
 from tools import handle_ticket, mark_triage_failed, mark_under_agent_review
@@ -19,6 +27,59 @@ logger = logging.getLogger(__name__)
 
 _DECISION_ADAPTER = TypeAdapter(TicketDecision)
 _POLICY_RETRIEVER = YAMLPolicyRetriever()
+
+_SAFETY_BLOCK_FALLBACK_ANSWER = (
+    "This looks like an active security incident in progress. "
+    "Contact the SOC immediately — do not wait for email follow-up."
+)
+
+
+def _iter_exception_chain(exc: BaseException):
+    seen: set[int] = set()
+    queue: list[BaseException] = [exc]
+    while queue:
+        current = queue.pop(0)
+        marker = id(current)
+        if marker in seen:
+            continue
+        seen.add(marker)
+        yield current
+        if current.__cause__ is not None:
+            queue.append(current.__cause__)
+        source = getattr(current, "source", None)
+        if isinstance(source, BaseException):
+            queue.append(source)
+
+
+def _exception_chain_text(exc: BaseException) -> str:
+    return " ".join(str(item) for item in _iter_exception_chain(exc)).casefold()
+
+
+def _is_empty_json_parse_error(exc: BaseException) -> bool:
+    for item in _iter_exception_chain(exc):
+        if isinstance(item, json.JSONDecodeError):
+            if item.pos == 0 and "expecting value" in str(item).casefold():
+                return True
+    return False
+
+
+def _is_llm_safety_block(exc: BaseException) -> bool:
+    """Detect Gemini safety filters that return empty structured output."""
+    if "prohibited_content" in _exception_chain_text(exc):
+        return True
+    if isinstance(exc, StructuredOutputValidationError) and _is_empty_json_parse_error(
+        exc
+    ):
+        return True
+    return False
+
+
+def _safety_block_fallback_decision() -> DeferDecision:
+    """Fail closed when the model refuses to answer security-incident tickets."""
+    return DeferDecision(
+        answer=_SAFETY_BLOCK_FALLBACK_ANSWER,
+        reason_code=DeferReasonCode.ACTIVE_INCIDENT,
+    )
 
 
 def process_ticket(jira_issue_id: str, body: str) -> TicketTriageResult:
@@ -120,7 +181,29 @@ def _triage_ticket(ticket_id: str, body: str) -> TicketDecision:
     decision: TicketDecision | None = None
 
     for attempt in range(max_attempts):
-        result = run_with_llm_retry(invoke)
+        try:
+            result = run_with_llm_retry(invoke)
+        except Exception as exc:
+            if _is_llm_safety_block(exc):
+                elapsed_ms = (time.perf_counter() - started) * 1000
+                logger.warning(
+                    "LLM safety block on %s; deferring as ACTIVE_INCIDENT",
+                    ticket_id,
+                )
+                logger.info(
+                    "LLM triage ticket=%s model=%s elapsed_ms=%.0f "
+                    "input_tokens=%s output_tokens=%s total_tokens=%s "
+                    "fallback=ACTIVE_INCIDENT",
+                    ticket_id,
+                    os.getenv("MODEL", "unknown"),
+                    elapsed_ms,
+                    None,
+                    None,
+                    None,
+                )
+                return _safety_block_fallback_decision()
+            raise
+
         structured = result.get("structured_response")
         if structured is None:
             error = ValueError("Agent did not return a structured decision")

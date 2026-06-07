@@ -9,6 +9,7 @@ import os
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain_core.language_models import BaseChatModel
 from pydantic import TypeAdapter
 
 from models import TicketDecision
@@ -37,7 +38,39 @@ def _require_model() -> str:
     return model
 
 
-_MODEL = _require_model()
+def _build_model() -> str | BaseChatModel:
+    """Return a LangChain model id or a configured chat model instance."""
+    model = _require_model()
+    if not model.startswith(_GOOGLE_MODEL_PREFIX):
+        return model
+
+    from google.genai import types
+    from langchain_google_genai import ChatGoogleGenerativeAI
+
+    # IT triage must handle simulated phishing/malware tickets without Gemini
+    # blocking the response (PROHIBITED_CONTENT → empty output).
+    safety_settings = {
+        types.HarmCategory.HARM_CATEGORY_HARASSMENT: (
+            types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+        types.HarmCategory.HARM_CATEGORY_HATE_SPEECH: (
+            types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+        types.HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: (
+            types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+        types.HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: (
+            types.HarmBlockThreshold.BLOCK_ONLY_HIGH
+        ),
+    }
+
+    return ChatGoogleGenerativeAI(
+        model=model.removeprefix(_GOOGLE_MODEL_PREFIX),
+        safety_settings=safety_settings,
+    )
+
+
+_MODEL = _build_model()
 _DECISION_RESPONSE_FORMAT = TypeAdapter(TicketDecision).json_schema()
 
 AGENT = create_agent(

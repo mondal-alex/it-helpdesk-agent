@@ -128,6 +128,7 @@ The user message is the ticket body (summary + description from the webhook).
 | Full corpus | Done | All clauses in context (~2.8k tokens) |
 | Pydantic schema | Done | Invalid RESOLVE/DEFER shapes rejected at parse |
 | Gate 1 | Done | `grounding.apply_grounding_gates` — every RESOLVE citation must resolve via `get_section()`; missing → fail closed to DEFER |
+| Gemini safety | Done | Relaxed `safety_settings` for incident tickets; if Gemini still blocks (`PROHIBITED_CONTENT`), runner fail-closes to `ACTIVE_INCIDENT` DEFER |
 | Gate 2 | Deferred | Entailment — answer supported by cited clause |
 | Retrieval threshold | Deferred | Low score → force `LOW_CONFIDENCE` DEFER |
 
