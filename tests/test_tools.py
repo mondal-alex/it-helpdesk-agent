@@ -75,30 +75,8 @@ def test_find_transition_id_returns_none_when_missing():
     assert _find_transition_id(transitions, "UNDER AGENT REVIEW") is None
 
 
-def test_build_transition_payload_includes_comment_and_label():
-    payload = _build_transition_payload(
-        "5",
-        comment="Agent answer",
-        label="resolved",
-    )
-
-    assert payload == {
-        "transition": {"id": "5"},
-        "update": {
-            "comment": [
-                {
-                    "add": {
-                        "body": _comment_adf_body("Agent answer"),
-                    }
-                }
-            ],
-            "labels": [{"add": "resolved"}],
-        },
-    }
-
-
-def test_build_transition_payload_transition_only():
-    assert _build_transition_payload("3") == {"transition": {"id": "3"}}
+def test_build_transition_payload_is_transition_only():
+    assert _build_transition_payload("5") == {"transition": {"id": "5"}}
 
 
 @patch("tools.jira_request")
@@ -116,23 +94,33 @@ def test_handle_ticket_uses_single_transition_request(
         "JIRA_API_TOKEN": "token",
     }[name]
     mock_get_transitions.return_value = [{"id": "9", "to": {"name": "RESOLVED"}}]
-    mock_jira_request.return_value = MagicMock(status_code=204)
+    mock_jira_request.side_effect = [
+        MagicMock(status_code=201),
+        MagicMock(status_code=204),
+        MagicMock(status_code=204),
+    ]
 
     decision = ResolveDecision(answer="ok", citations=["POL-01 §1.4"])
     handle_ticket("HELIX-1", decision)
 
-    assert mock_jira_request.call_count == 1
-    call = mock_jira_request.call_args
-    assert call.args[0] == "POST"
-    assert call.args[1].endswith("/rest/api/3/issue/HELIX-1/transitions")
+    assert mock_jira_request.call_count == 3
 
-    body = json.loads(call.kwargs["data"])
-    assert body["transition"] == {"id": "9"}
-    assert body["update"]["labels"] == [{"add": "resolved"}]
-    comment_text = body["update"]["comment"][0]["add"]["body"]["content"][0]["content"][0][
-        "text"
-    ]
+    comment_call = mock_jira_request.call_args_list[0]
+    assert comment_call.args[0] == "POST"
+    assert comment_call.args[1].endswith("/rest/api/3/issue/HELIX-1/comment")
+    comment_body = json.loads(comment_call.kwargs["data"])
+    comment_text = comment_body["body"]["content"][0]["content"][0]["text"]
     assert comment_text == "Action: RESOLVED"
+
+    transition_call = mock_jira_request.call_args_list[1]
+    assert transition_call.args[0] == "POST"
+    assert transition_call.args[1].endswith("/rest/api/3/issue/HELIX-1/transitions")
+    assert json.loads(transition_call.kwargs["data"]) == {"transition": {"id": "9"}}
+
+    label_call = mock_jira_request.call_args_list[2]
+    assert label_call.args[0] == "PUT"
+    label_body = json.loads(label_call.kwargs["data"])
+    assert label_body["update"]["labels"] == [{"add": "resolved"}]
 
 
 @patch("tools.transition_issue_to_status")

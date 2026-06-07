@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Start FastAPI locally and expose it via ngrok using WEBHOOK_PUBLIC_URL from .env.
+#
+# Terminal 1 shows agent logs (QUEUED/START/DONE, LLM metrics, errors).
+# ngrok runs in the background — open http://127.0.0.1:4040 for the request dashboard.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,7 +23,7 @@ PUBLIC_URL="${WEBHOOK_PUBLIC_URL:-}"
 
 if [[ -z "$PUBLIC_URL" ]]; then
   echo "Set WEBHOOK_PUBLIC_URL in .env (ngrok free static domain)." >&2
-  echo "See README → Local dev with ngrok." >&2
+  echo "See README → Running." >&2
   exit 1
 fi
 
@@ -29,17 +32,25 @@ if ! command -v ngrok >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Jira webhook URL: ${PUBLIC_URL%/}/rest/webhooks/jira"
-echo "Starting uvicorn on 0.0.0.0:${PORT} ..."
-
-uv run uvicorn serve:app --host 0.0.0.0 --port "$PORT" &
-UVICORN_PID=$!
+LOG_DIR="${ROOT}/logs"
+mkdir -p "$LOG_DIR"
+AGENT_LOG="${LOG_DIR}/agent.log"
 
 cleanup() {
-  kill "$UVICORN_PID" 2>/dev/null || true
+  kill "$NGROK_PID" 2>/dev/null || true
 }
 trap cleanup EXIT INT TERM
 
-sleep 1
+echo "Jira webhook URL: ${PUBLIC_URL%/}/rest/webhooks/jira"
+echo "ngrok dashboard:  http://127.0.0.1:4040"
+echo "Log file:         ${AGENT_LOG}"
+echo
 echo "Starting ngrok tunnel → ${PUBLIC_URL} ..."
-exec ngrok http --url="$PUBLIC_URL" "$PORT"
+ngrok http --url="$PUBLIC_URL" "$PORT" >/dev/null 2>&1 &
+NGROK_PID=$!
+
+sleep 2
+echo "Starting uvicorn on 0.0.0.0:${PORT} ..."
+echo "--- agent logs ---"
+
+uv run uvicorn serve:app --host 0.0.0.0 --port "$PORT" 2>&1 | tee -a "$AGENT_LOG"

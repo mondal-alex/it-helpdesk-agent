@@ -90,7 +90,7 @@ fi
 
 echo
 echo "=== Waiting for triage to finish (${EXPECTED} rows in ${CSV}) ==="
-echo "Watch Terminal 1 for QUEUED / START / DONE / ALL DONE logs."
+echo "Watch Terminal 1 (dev.sh) for QUEUED / START / DONE / ALL DONE logs."
 deadline=$((SECONDS + 600))
 while (( SECONDS < deadline )); do
   if [[ -f "$CSV" ]]; then

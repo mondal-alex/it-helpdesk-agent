@@ -100,11 +100,11 @@ uv run python -m eval.run_eval --output eval/results.csv
 | `GET` | `/health` | Liveness |
 | `POST` | `/rest/webhooks/jira` | Jira webhook |
 
-**Logging:** `LOG_LEVEL` at `serve.py` startup and `eval/run_eval.py` main. Each triage logs `elapsed_ms` + token counts from `runner`. Ticket bodies are never logged.
+**Logging:** `LOG_LEVEL` at `serve.py` startup and `eval/run_eval.py` main. `./scripts/dev.sh` prints agent logs in Terminal 1 (`QUEUED`/`DONE`, LLM metrics, errors) and saves them to `logs/agent.log`. ngrok request history: http://127.0.0.1:4040. Ticket bodies are never logged.
 
 **Seed eval tickets** (disable webhook first): `uv run python scripts/jira_eval_tickets.py seed` · delete: `delete --yes` · manifest: `eval/seeded_jira_issues.json`
 
-**Live demo (~4 min):** Terminal 1: `rm -f eval/live_results.csv && ./scripts/dev-teardown.sh && ./scripts/dev.sh` (`EVAL_BULK_MODE=1`, Gemini + key). Terminal 2: seed script. Wait for `ALL DONE — 50/50`, then `uv run python scripts/summarize_live_eval.py`.
+**Live demo (~4 min):** Terminal 1: `rm -f eval/live_results.csv && ./scripts/dev-teardown.sh && ./scripts/dev.sh` — keep this visible for progress logs (`EVAL_BULK_MODE=1`, Gemini + key). Terminal 2: seed script. Wait for `ALL DONE — 50/50`, then `uv run python scripts/summarize_live_eval.py`.
 
 ## Prompt strategy
 

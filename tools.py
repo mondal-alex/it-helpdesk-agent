@@ -74,7 +74,7 @@ def handle_ticket(
     jira_issue_id: str,
     decision: TicketDecision,
 ) -> None:
-    """Apply a triage decision to Jira in one atomic transition request."""
+    """Apply a triage decision to Jira: comment, transition, label."""
     comment = format_ticket_comment(decision)
     status, label = _match(decision.action)
     transition_issue_to_status(
@@ -128,12 +128,11 @@ def transition_issue_to_status(
             "workflow state allows transitioning to it."
         )
 
-    _transition_with_updates(
-        issue_id,
-        destination_id=transition_id,
-        comment=comment,
-        label=label,
-    )
+    if comment is not None:
+        _post_comment(issue_id, comment)
+    _transition_with_updates(issue_id, destination_id=transition_id)
+    if label is not None:
+        _add_label_to_issue(issue_id, label)
 
 
 def _match(ticket_action: TicketAction) -> Tuple[str, str]:
@@ -158,22 +157,13 @@ def _comment_adf_body(text: str) -> dict:
     return {"type": "doc", "version": 1, "content": paragraphs}
 
 
-def _build_transition_payload(
-    destination_id: str,
-    *,
-    comment: str | None = None,
-    label: str | None = None,
-) -> dict:
-    """Build a Jira transition request body with optional comment and label."""
-    body: dict = {"transition": {"id": destination_id}}
-    update: dict = {}
-    if comment is not None:
-        update["comment"] = [{"add": {"body": _comment_adf_body(comment)}}]
-    if label is not None:
-        update["labels"] = [{"add": label}]
-    if update:
-        body["update"] = update
-    return body
+def _build_transition_payload(destination_id: str) -> dict:
+    """Build a Jira transition request body (status change only).
+
+    Comments and labels use separate endpoints — Jira Cloud often accepts
+    bundled transition payloads but silently ignores comment/label updates.
+    """
+    return {"transition": {"id": destination_id}}
 
 
 def _get_available_transitions(issue_id: str) -> List[dict]:
@@ -192,26 +182,41 @@ def _get_available_transitions(issue_id: str) -> List[dict]:
     return response.json()["transitions"]
 
 
+def _post_comment(issue_id: str, comment: str) -> None:
+    """Post a comment to a Jira issue."""
+    url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}/comment"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps({"body": _comment_adf_body(comment)})
+
+    response = jira_request(
+        "POST",
+        url,
+        data=payload,
+        headers=headers,
+        auth=_jira_auth(),
+        timeout=10,
+    )
+    if response.status_code != 201:
+        raise requests.HTTPError(
+            f"Error posting comment: status {response.status_code}: {response.text}"
+        )
+
+
 def _transition_with_updates(
     issue_id: str,
     *,
     destination_id: str,
-    comment: str | None = None,
-    label: str | None = None,
 ) -> None:
-    """Transition a Jira issue, bundling comment and label in the same request."""
+    """Transition a Jira issue to a new workflow status."""
     url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}/transitions"
     headers = {
         "Accept": "application/json",
         "Content-Type": "application/json",
     }
-    payload = json.dumps(
-        _build_transition_payload(
-            destination_id,
-            comment=comment,
-            label=label,
-        )
-    )
+    payload = json.dumps(_build_transition_payload(destination_id))
 
     response = jira_request(
         "POST",
@@ -224,4 +229,27 @@ def _transition_with_updates(
     if response.status_code != 204:
         raise requests.HTTPError(
             f"Error transitioning issue: status {response.status_code}: {response.text}"
+        )
+
+
+def _add_label_to_issue(issue_id: str, label: str) -> None:
+    """Add a label to a Jira issue."""
+    url = f"{_jira_base_url()}/rest/api/3/issue/{issue_id}"
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
+    payload = json.dumps({"update": {"labels": [{"add": label}]}})
+
+    response = jira_request(
+        "PUT",
+        url,
+        data=payload,
+        headers=headers,
+        auth=_jira_auth(),
+        timeout=10,
+    )
+    if response.status_code not in {200, 204}:
+        raise requests.HTTPError(
+            f"Error adding label: status {response.status_code}: {response.text}"
         )
