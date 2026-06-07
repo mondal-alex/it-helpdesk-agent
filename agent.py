@@ -25,7 +25,7 @@ def _require_model() -> str:
     if not model:
         raise RuntimeError(
             "Missing MODEL environment variable. Set it in .env — e.g. "
-            "ollama:qwen2.5:7b (local) or google_genai:gemini-2.0-flash (Google free tier)."
+            "ollama:qwen2.5:7b (local) or google_genai:gemini-3.5-flash (Google free tier)."
         )
     if model.startswith(_GOOGLE_MODEL_PREFIX) and not (
         os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")

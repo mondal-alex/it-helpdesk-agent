@@ -6,7 +6,7 @@ import time
 from typing import Any
 
 from langchain_core.messages import AIMessage
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from agent import AGENT
 from grounding import apply_grounding_gates
@@ -115,14 +115,38 @@ def _triage_ticket(ticket_id: str, body: str) -> TicketDecision:
         return AGENT.invoke({"messages": [("user", body.strip())]})
 
     started = time.perf_counter()
-    result = run_with_llm_retry(invoke)
+    max_attempts = int(os.getenv("API_RETRY_MAX_ATTEMPTS", "5"))
+    result: dict | None = None
+    decision: TicketDecision | None = None
+
+    for attempt in range(max_attempts):
+        result = run_with_llm_retry(invoke)
+        structured = result.get("structured_response")
+        if structured is None:
+            error = ValueError("Agent did not return a structured decision")
+            if attempt >= max_attempts - 1:
+                raise error
+            logger.warning(
+                "Missing structured decision; retrying (%s/%s)",
+                attempt + 1,
+                max_attempts,
+            )
+            continue
+
+        try:
+            decision = _DECISION_ADAPTER.validate_python(structured)
+            break
+        except ValidationError:
+            if attempt >= max_attempts - 1:
+                raise
+            logger.warning(
+                "Invalid structured decision; retrying (%s/%s)",
+                attempt + 1,
+                max_attempts,
+            )
+
+    assert result is not None and decision is not None
     elapsed_ms = (time.perf_counter() - started) * 1000
-
-    structured = result.get("structured_response")
-    if structured is None:
-        raise ValueError("Agent did not return a structured decision")
-
-    decision = _DECISION_ADAPTER.validate_python(structured)
     usage = _summarize_llm_usage(result.get("messages"))
     logger.info(
         "LLM triage ticket=%s model=%s elapsed_ms=%.0f "

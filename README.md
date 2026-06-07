@@ -72,7 +72,7 @@ Copy `.env.example` to `.env`. Status names are matched case-insensitively again
 
 | Variable | Required | Purpose |
 |----------|----------|---------|
-| `MODEL` | Yes | e.g. `google_genai:gemini-2.5-flash`, `ollama:qwen2.5:7b` |
+| `MODEL` | Yes | e.g. `google_genai:gemini-3.5-flash`, `ollama:qwen2.5:7b` |
 | `GOOGLE_API_KEY` | For Gemini | [AI Studio](https://aistudio.google.com/apikey) |
 | `JIRA_DOMAIN`, `JIRA_EMAIL`, `JIRA_API_TOKEN` | Yes | Jira REST auth |
 | `IN_REVIEW_COLUMN_STATUS` | Yes | e.g. `Under Agent Review` |
